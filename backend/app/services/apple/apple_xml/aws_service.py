@@ -1,7 +1,7 @@
 from logging import getLogger
 
 import boto3
-from botocore.exceptions import NoCredentialsError
+from botocore.exceptions import NoCredentialsError, PartialCredentialsError
 
 from app.config import settings
 from app.utils.structured_logging import log_structured
@@ -19,7 +19,7 @@ def get_s3_client():  # noqa: ANN201
             aws_access_key_id=settings.aws_access_key_id,
             aws_secret_access_key=settings.aws_secret_access_key.get_secret_value(),
         )
-    except (NoCredentialsError, AttributeError):
+    except (NoCredentialsError, PartialCredentialsError, AttributeError):
         log_structured(logger, "warning", "AWS credentials not configured")
         return None
 
@@ -32,6 +32,6 @@ def get_sns_client():  # noqa: ANN201
             aws_access_key_id=settings.aws_access_key_id,
             aws_secret_access_key=settings.aws_secret_access_key.get_secret_value(),
         )
-    except (NoCredentialsError, AttributeError):
+    except (NoCredentialsError, PartialCredentialsError, AttributeError):
         log_structured(logger, "warning", "AWS credentials not configured")
         return None
