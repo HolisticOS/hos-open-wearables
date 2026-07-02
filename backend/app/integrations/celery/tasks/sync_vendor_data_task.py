@@ -1,11 +1,12 @@
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from logging import getLogger
 from typing import Any, cast
 from uuid import UUID, uuid4
 
 from celery import shared_task
 
+from app.config import settings
 from app.database import SessionLocal
 from app.repositories.provider_settings_repository import ProviderSettingsRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
@@ -15,6 +16,7 @@ from app.schemas.sync_status import SyncSource, SyncStage, SyncStatus
 from app.services.providers.factory import ProviderFactory
 from app.services.sync_coordination import release_primary, release_stale_primary, try_become_primary
 from app.services.sync_status_service import completed, failed, new_run_id, progress, started
+from app.utils.config_utils import format_duration
 from app.utils.context import trace_id_var
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
@@ -251,6 +253,13 @@ def sync_vendor_data(
                     strategy = factory.get_provider(provider_name)
                     provider_result = ProviderSyncResult(success=True, params={})
 
+                    # New-vs-updated split for the sync-log (timeseries upserts report it
+                    # via WriteCounts). items_processed is derived from these so the headline
+                    # count always equals "X new, Y updated".
+                    pull_inserted = 0
+                    pull_updated = 0
+                    applied_lookback: timedelta | None = None  # set when the lookback actually widened the window
+
                     # Resolve effective start: explicit arg > last_synced_at > now
                     # This ensures live syncs never re-pull history.
                     effective_start = start_date
@@ -259,6 +268,15 @@ def sync_vendor_data(
                         if last is not None:
                             if last.tzinfo is None:
                                 last = last.replace(tzinfo=timezone.utc)
+                            # Optional trailing lookback so late provider revisions get
+                            # re-fetched (live pull only; capped by max_historical_days).
+                            lookback = settings.pull_sync_lookback
+                            if lookback is not None and not is_historical:
+                                last -= lookback
+                                max_days = strategy.capabilities.max_historical_days
+                                if max_days is not None:
+                                    last = max(last, datetime.now(timezone.utc) - timedelta(days=max_days))
+                                applied_lookback = lookback
                             effective_start = last.isoformat()
                         else:
                             # First ever sync — start from now, historical must be explicit
@@ -336,6 +354,9 @@ def sync_vendor_data(
                                     is_first_sync=is_first_sync,
                                 )
                                 provider_result.params["data_247"] = {"success": True, "saved": True, **results_247}
+                                for _count in results_247.values():
+                                    pull_inserted += getattr(_count, "inserted", 0)
+                                    pull_updated += getattr(_count, "updated", 0)
                             else:
                                 results_247 = strategy.data_247.load_all_247_data(
                                     db,
@@ -418,6 +439,8 @@ def sync_vendor_data(
                         provider=provider_name,
                         task="sync_vendor_data",
                         user_id=user_id,
+                        effective_start=effective_start,
+                        lookback=format_duration(settings.pull_sync_lookback) if settings.pull_sync_lookback else None,
                     )
 
                     sub_results = list(provider_result.params.values())
@@ -445,6 +468,26 @@ def sync_vendor_data(
                             metadata={"is_historical": is_historical, "params": provider_result.params},
                         )
                     else:
+                        # inserted/updated are run-level totals across all timeseries
+                        # types: a single sync (historical included) can have both —
+                        # e.g. new days inserted while overlapping days are refreshed.
+                        completed_metadata: dict[str, Any] = {
+                            "is_historical": is_historical,
+                            "params": provider_result.params,
+                        }
+                        completed_message = (
+                            f"Sync from {provider_name} completed"
+                            if not any_failed
+                            else f"Sync from {provider_name} completed with errors"
+                        )
+                        if pull_inserted or pull_updated:
+                            completed_metadata["inserted"] = pull_inserted
+                            completed_metadata["updated"] = pull_updated
+                            completed_message += f" · {pull_inserted} new, {pull_updated} updated"
+                        if applied_lookback is not None:
+                            lookback_label = format_duration(applied_lookback)
+                            completed_metadata["lookback"] = lookback_label
+                            completed_message += f" · lookback {lookback_label}"
                         _emit_sync_status(
                             completed,
                             user_uuid,
@@ -452,13 +495,10 @@ def sync_vendor_data(
                             sync_source,
                             run_id=run_id,
                             status=final_status,
-                            message=(
-                                f"Sync from {provider_name} completed"
-                                if not any_failed
-                                else f"Sync from {provider_name} completed with errors"
-                            ),
+                            message=completed_message,
+                            items_processed=pull_inserted + pull_updated,
                             primary_user_id=primary_uuid,
-                            metadata={"is_historical": is_historical, "params": provider_result.params},
+                            metadata=completed_metadata,
                         )
 
                 except Exception as e:
