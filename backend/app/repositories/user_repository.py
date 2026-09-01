@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import desc, func, literal, nullsfirst, nullslast, or_, select
+from sqlalchemy import String, cast, desc, func, literal, nullsfirst, nullslast, or_, select
 from sqlalchemy.orm import Query
 
 from app.database import DbSession
@@ -55,6 +55,7 @@ class UserRepository(CrudRepository[User, UserCreateInternal, UserUpdateInternal
             search_term = f"%{escaped_search}%"
             query = query.filter(
                 or_(
+                    cast(self.model.id, String).ilike(search_term, escape="\\"),
                     self.model.email.ilike(search_term, escape="\\"),
                     self.model.first_name.ilike(search_term, escape="\\"),
                     self.model.last_name.ilike(search_term, escape="\\"),
