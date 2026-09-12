@@ -27,6 +27,10 @@ from app.schemas.providers.mobile_sdk import (
     SyncRequest as SDKSyncRequest,
 )
 from app.services.apple.healthkit.device_resolution import extract_device_info
+from app.services.apple.healthkit.exceptions import (
+    SleepLockTimeoutError,
+    SleepPersistenceError,
+)
 from app.services.event_record_service import event_record_service
 from app.utils.structured_logging import log_structured
 
@@ -234,8 +238,10 @@ def handle_sleep_data(
     try:
         acquired = lock.acquire()
         if not acquired:
-            logger.warning("Could not acquire sleep processing lock for user %s; skipping batch", user_id)
-            return
+            # Raise instead of silently dropping the batch: process_sdk_upload's
+            # autoretry_for(TransientImportError) will retry the whole batch with
+            # backoff rather than losing these samples for good (fix OW-02).
+            raise SleepLockTimeoutError(f"Could not acquire sleep processing lock for user {user_id}")
 
         current_state = load_sleep_state(user_id)
         provider = request.provider
@@ -477,8 +483,11 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
             start_time = min(start_time, cleaned_stages[0].start_time)
             end_time = max(end_time, cleaned_stages[-1].end_time)
 
-        # Remove the old record before creating the merged one (cascade deletes detail).
-        event_record_service.delete(db_session, adjacent.id)
+        # NOTE: the superseded `adjacent` record is deleted further down, only
+        # after the merged replacement has been successfully created — see
+        # fix OW-03. Deleting it here, before the new record exists, meant a
+        # failure between the two calls lost the adjacent record's data with
+        # nothing to replace it.
 
     # ---
 
@@ -525,6 +534,14 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         # Always use the returned record's ID (whether newly created or existing)
         detail_for_record = detail.model_copy(update={"record_id": created_or_existing_record.id})
         event_record_service.create_detail(db_session, detail_for_record, detail_type="sleep")
+
+        if adjacent is not None:
+            # Only remove the superseded record now that the merged replacement
+            # is safely persisted (fix OW-03 — previously this ran before the
+            # create above, so a write failure here lost the adjacent record
+            # with nothing to replace it).
+            event_record_service.delete(db_session, adjacent.id)
+
         # Delete from Redis only after a successful DB write so a transient error
         # keeps the session available for the next periodic finalization attempt.
         delete_sleep_state(user_id)
@@ -539,3 +556,10 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
             sleep_record_id=sleep_record.id,
             error=str(e),
         )
+        # Re-raise (as a typed, retryable error) instead of swallowing: the
+        # inline caller (handle_sleep_data → import_service) needs this to
+        # propagate so process_sdk_upload's autoretry_for policy can retry,
+        # and the periodic finalize_stale_sleeps sweep already isolates each
+        # user in its own try/except, so raising here doesn't affect other
+        # users in that sweep (fix OW-03).
+        raise SleepPersistenceError(f"Failed to persist sleep record for user {user_id}") from e

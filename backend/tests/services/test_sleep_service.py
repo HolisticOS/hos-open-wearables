@@ -26,6 +26,10 @@ from app.schemas.providers.mobile_sdk import (
     SleepStateStage,
     SyncRequest,
 )
+from app.services.apple.healthkit.exceptions import (
+    SleepLockTimeoutError,
+    SleepPersistenceError,
+)
 from app.services.apple.healthkit.sleep_service import (
     _calculate_final_metrics,
     finish_sleep,
@@ -820,11 +824,25 @@ class TestHistoricalBulkUploadMerging:
         # find_adjacent_sleep_record must have been called to look for a matching record
         mock_event_service.find_adjacent_sleep_record.assert_called_once()
 
-        # The old record must be deleted before the merged one is created
+        # The merged record must be created (and its detail attached) BEFORE the
+        # superseded one is deleted — fix OW-03. Deleting first meant a failure
+        # between the two calls lost the adjacent record with nothing to
+        # replace it. Asserting on mock_calls order (not just "both were
+        # called") is what actually pins the fix down.
         mock_event_service.delete.assert_called_once_with(db, mock_adjacent.id)
-
-        # A new (merged) record must be created
         mock_event_service.create.assert_called_once()
+
+        def _first_index(prefix: str) -> int:
+            for i, c in enumerate(mock_event_service.mock_calls):
+                if str(c).startswith(prefix):
+                    return i
+            raise AssertionError(f"no call matching {prefix!r} in {mock_event_service.mock_calls}")
+
+        create_call_index = _first_index("call.create(")
+        create_detail_call_index = _first_index("call.create_detail(")
+        delete_call_index = _first_index("call.delete(")
+        assert create_call_index < delete_call_index
+        assert create_detail_call_index < delete_call_index
         created_record: EventRecordCreate = mock_event_service.create.call_args[0][1]
 
         # Merged window covers both A and B
@@ -839,3 +857,106 @@ class TestHistoricalBulkUploadMerging:
         assert SleepStageType.LIGHT in stage_types
         assert SleepStageType.DEEP in stage_types
         assert SleepStageType.REM in stage_types
+
+
+class TestSleepLockTimeoutRaises:
+    """OW-02: a lock-acquisition timeout must retry, not silently drop the batch.
+
+    Previously ``handle_sleep_data`` logged a warning and returned on a lock
+    timeout, dropping the whole batch with no signal. It must now raise
+    ``SleepLockTimeoutError`` so ``process_sdk_upload``'s ``autoretry_for``
+    policy gets a chance to retry.
+    """
+
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    def test_lock_not_acquired_raises_instead_of_returning(
+        self,
+        mock_redis_func: MagicMock,
+        mock_event_service: MagicMock,
+        db: Session,
+    ) -> None:
+        user_id = str(uuid4())
+
+        mock_lock = MagicMock()
+        mock_lock.acquire.return_value = False  # Someone else holds the lock
+
+        mock_redis = MagicMock()
+        mock_redis.lock.return_value = mock_lock
+        mock_redis_func.return_value = mock_redis
+
+        request = SyncRequest.model_validate(OLD_WATCH_PAYLOAD)
+
+        with pytest.raises(SleepLockTimeoutError):
+            handle_sleep_data(db, request, user_id)
+
+        # The lock must still be released even though we're raising out of the
+        # try block (handled by the existing `finally: lock.release()`).
+        mock_lock.release.assert_called_once()
+
+        # Nothing should have been written — the batch is retried whole, not
+        # partially applied.
+        mock_event_service.create.assert_not_called()
+
+
+class TestFinishSleepPersistenceFailureRaises:
+    """OW-03: a DB write failure while finalizing sleep must not be swallowed.
+
+    Previously ``finish_sleep`` logged the exception and returned as if
+    nothing had happened. It must now raise ``SleepPersistenceError`` (a
+    ``TransientImportError``) so callers can retry, and — combined with the
+    create-before-delete reordering — the superseded adjacent record must
+    still exist afterward rather than having been deleted with nothing to
+    replace it.
+    """
+
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    def test_create_detail_failure_raises_and_does_not_delete_adjacent(
+        self,
+        mock_event_service: MagicMock,
+        db: Session,
+    ) -> None:
+        adjacent_id = uuid4()
+        mock_adjacent = MagicMock()
+        mock_adjacent.id = adjacent_id
+        mock_adjacent.start_datetime = _dt("2026-03-22T23:00:00Z")
+        mock_adjacent.end_datetime = _dt("2026-03-23T01:00:00Z")
+        mock_adjacent.detail = None
+
+        mock_event_service.find_adjacent_sleep_record.return_value = mock_adjacent
+        mock_created = MagicMock()
+        mock_created.id = uuid4()
+        mock_event_service.create.return_value = mock_created
+        # Simulate a transient DB failure writing the detail row.
+        mock_event_service.create_detail.side_effect = RuntimeError("db write failed")
+
+        state = SleepState(
+            uuid=str(uuid4()),
+            source_name="Apple Watch",
+            device_model=None,
+            provider=None,
+            start_time=_dt("2026-03-23T01:00:00Z"),
+            end_time=_dt("2026-03-23T06:00:00Z"),
+            last_start_timestamp=_dt("2026-03-23T01:00:00Z"),
+            last_end_timestamp=_dt("2026-03-23T06:00:00Z"),
+            in_bed_seconds=0,
+            awake_seconds=0,
+            light_seconds=18000,
+            deep_seconds=0,
+            rem_seconds=0,
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.LIGHT,
+                    start_time=_dt("2026-03-23T01:00:00Z"),
+                    end_time=_dt("2026-03-23T06:00:00Z"),
+                )
+            ],
+        )
+
+        with pytest.raises(SleepPersistenceError):
+            finish_sleep(db, str(uuid4()), state)
+
+        # The superseded record must NOT have been deleted — the merged
+        # replacement never made it into the DB, so deleting it would have
+        # lost data with nothing to replace it (the OW-03 bug).
+        mock_event_service.delete.assert_not_called()

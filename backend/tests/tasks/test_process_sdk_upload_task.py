@@ -131,3 +131,19 @@ class TestProcessSDKUploadTask:
         call_args = mock_user_repo.get.call_args
         assert call_args[0][0] == mock_db
         assert call_args[0][1] == UUID(user_id)
+
+
+class TestProcessSDKUploadRetryPolicy:
+    """OW-01: a worker crash or transient DB error must retry, not lose the batch.
+
+    The phone's HealthKit anchor has already advanced by the time we've
+    accepted a batch, so a dropped batch is gone for good — there is nothing
+    to resend. This pins down the retry policy on the task itself so it can't
+    silently regress back to a bare ``@shared_task``.
+    """
+
+    def test_task_has_retry_policy_configured(self) -> None:
+        assert process_sdk_upload.acks_late is True
+        assert process_sdk_upload.max_retries == 5
+        assert Exception in process_sdk_upload.autoretry_for
+        assert process_sdk_upload.retry_backoff is True

@@ -72,7 +72,12 @@ def sync_sdk_data(
     workouts_count = len(data.workouts)
     sleep_count = len(data.sleep)
 
-    # Log initial batch receipt with counts
+    # Log initial batch receipt with counts. auth_type/api_key_id are included
+    # so an API-key-authenticated write to a given user_id (accepted for
+    # backwards compatibility — see test_sdk_sync_auth.py and
+    # scripts/replay_raw_payloads.py's --target-user-id — the API key is a
+    # full-trust service credential, not scoped to a single user) has an
+    # audit trail of which credential wrote to which user (fix OW-04).
     log_structured(
         logger,
         "info",
@@ -85,6 +90,8 @@ def sync_sdk_data(
         workouts_count=workouts_count,
         sleep_count=sleep_count,
         total_items=records_count + workouts_count + sleep_count,
+        auth_type=auth.auth_type,
+        api_key_id=str(auth.api_key_id) if auth.auth_type == "api_key" else None,
     )
 
     content_str = body.model_dump_json()

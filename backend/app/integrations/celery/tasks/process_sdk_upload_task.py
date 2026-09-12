@@ -27,7 +27,15 @@ def _get_import_service(provider: str) -> SDKImportService:
     raise ValueError(f"Unsupported provider: {provider}")
 
 
-@shared_task(queue="sdk_sync")
+@shared_task(
+    queue="sdk_sync",
+    acks_late=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=600,
+    retry_jitter=True,
+    max_retries=5,
+)
 def process_sdk_upload(
     content: str,
     content_type: str,

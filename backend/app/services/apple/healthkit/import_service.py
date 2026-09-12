@@ -35,6 +35,7 @@ from app.services.timeseries_service import timeseries_service
 from app.utils.structured_logging import log_structured
 
 from .device_resolution import extract_device_info
+from .exceptions import TransientImportError
 from .sleep_service import handle_sleep_data
 
 
@@ -372,6 +373,22 @@ class ImportService:
                 sleep_saved=saved_counts["sleep_saved"],
             )
 
+        except TransientImportError:
+            # Infra-level failure (lock contention, a DB write) rather than a
+            # bad payload: let it propagate so process_sdk_upload's
+            # autoretry_for policy retries the whole batch with backoff
+            # instead of permanently reporting it as a 400 "bad import"
+            # (fix OW-01/OW-02/OW-03).
+            log_structured(
+                self.log,
+                "warning",
+                f"Transient import failure for user {user_id}, will retry",
+                provider=f"{provider}",
+                action=f"{provider}_sdk_import_transient_failure",
+                batch_id=batch_id,
+                user_id=user_id,
+            )
+            raise
         except Exception as e:
             log_structured(
                 self.log,
