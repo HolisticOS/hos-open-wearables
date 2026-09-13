@@ -44,6 +44,15 @@ _STAGE_TO_METRIC: dict[str, str] = {
     "rem": "rem_seconds",
 }
 
+# Apple HealthKit sleep-analysis samples carry no explicit "is this a nap"
+# flag (unlike e.g. WHOOP's `nap` field or Suunto's `IsNap`), so we fall back
+# to a duration heuristic: any session with less than 3 hours of actual sleep
+# is treated as a nap. 180 minutes matches the same fallback threshold used
+# elsewhere in the Entropy stack for sources without a native nap flag (see
+# hos-spike-service `health_data_service.py`'s `dur_min < 180` check), so
+# Apple-derived naps are classified consistently with other providers.
+NAP_MAX_SLEEP_SECONDS = 180 * 60
+
 
 def key(user_id: str) -> str:
     """Generate a key for the sleep state."""
@@ -534,6 +543,20 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         device_model=state.device_model,
     )
 
+    # Nap inference: Apple HealthKit gives us no native nap/main-sleep flag
+    # (nothing like WHOOP's `nap` boolean or Suunto's `IsNap`), and this
+    # service processes one session at a time with no reliable cross-session
+    # "typical bedtime window" to compare against, so a duration-only
+    # heuristic is used. A session counts as a nap when its actual sleep time
+    # (sleeping + light + deep + rem, i.e. `total_sleep_seconds` -- computed
+    # post-merge above so a night that arrives as several small SDK payloads
+    # is measured by its final combined length, not an in-progress chunk) is
+    # under NAP_MAX_SLEEP_SECONDS (3 hours). This mirrors the same duration
+    # fallback used for other sources lacking a native nap flag elsewhere in
+    # the Entropy stack (hos-spike-service), so naps are classified
+    # consistently across providers.
+    is_nap = total_sleep_seconds < NAP_MAX_SLEEP_SECONDS
+
     detail = EventRecordDetailCreate(
         record_id=sleep_record.id,
         sleep_total_duration_minutes=int(total_sleep_seconds // 60),
@@ -543,7 +566,7 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         sleep_light_minutes=int(metrics["light_seconds"] // 60),
         sleep_awake_minutes=int(metrics["awake_seconds"] // 60),
         sleep_efficiency_score=sleep_efficiency,
-        is_nap=False,  # TODO: Infer if nap, maybe from sleep length < 1 hour / 2 hours?
+        is_nap=is_nap,
         sleep_stages=cleaned_stages or None,
     )
 

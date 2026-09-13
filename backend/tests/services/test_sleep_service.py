@@ -531,6 +531,177 @@ class TestFinishSleep:
         assert detail.sleep_total_duration_minutes == 245  # light+deep+rem (no sleeping)
 
 
+class TestNapInference:
+    """Tests for is_nap inference in finish_sleep.
+
+    Apple HealthKit gives no native nap/main-sleep flag, so finish_sleep falls
+    back to a duration heuristic: actual sleep time (sleeping+light+deep+rem)
+    under NAP_MAX_SLEEP_SECONDS (3 hours / 180 minutes) is a nap. This mirrors
+    the same `duration < 180 min` fallback used elsewhere in the Entropy stack
+    (hos-spike-service) for sources without a native nap flag.
+    """
+
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    def test_short_daytime_session_is_nap(
+        self,
+        mock_delete_state: MagicMock,
+        mock_event_service: MagicMock,
+        db: Session,
+    ) -> None:
+        """A short (30 min) daytime session should be flagged as a nap."""
+        user_id = str(uuid4())
+        mock_record = MagicMock()
+        mock_record.id = uuid4()
+        mock_event_service.create.return_value = mock_record
+        mock_event_service.find_adjacent_sleep_record.return_value = None
+
+        state = SleepState(
+            uuid=str(uuid4()),
+            source_name="Apple Watch",
+            device_model="Watch7,1",
+            provider="apple",
+            start_time=_dt("2026-03-15T14:00:00Z"),
+            end_time=_dt("2026-03-15T14:30:00Z"),
+            last_start_timestamp=_dt("2026-03-15T14:00:00Z"),
+            last_end_timestamp=_dt("2026-03-15T14:30:00Z"),
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.SLEEPING,
+                    start_time=_dt("2026-03-15T14:00:00Z"),
+                    end_time=_dt("2026-03-15T14:30:00Z"),
+                ),
+            ],
+        )
+
+        finish_sleep(db, user_id, state)
+
+        detail = mock_event_service.create_detail.call_args[0][1]
+        assert detail.sleep_total_duration_minutes == 30
+        assert detail.is_nap is True
+
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    def test_full_night_session_is_not_nap(
+        self,
+        mock_delete_state: MagicMock,
+        mock_event_service: MagicMock,
+        db: Session,
+    ) -> None:
+        """A normal full-night (8 hour) session should not be flagged as a nap."""
+        user_id = str(uuid4())
+        mock_record = MagicMock()
+        mock_record.id = uuid4()
+        mock_event_service.create.return_value = mock_record
+        mock_event_service.find_adjacent_sleep_record.return_value = None
+
+        state = SleepState(
+            uuid=str(uuid4()),
+            source_name="Apple Watch",
+            device_model="Watch7,1",
+            provider="apple",
+            start_time=_dt("2026-03-15T23:00:00Z"),
+            end_time=_dt("2026-03-16T07:00:00Z"),
+            last_start_timestamp=_dt("2026-03-15T23:00:00Z"),
+            last_end_timestamp=_dt("2026-03-16T07:00:00Z"),
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.SLEEPING,
+                    start_time=_dt("2026-03-15T23:00:00Z"),
+                    end_time=_dt("2026-03-16T07:00:00Z"),
+                ),
+            ],
+        )
+
+        finish_sleep(db, user_id, state)
+
+        detail = mock_event_service.create_detail.call_args[0][1]
+        assert detail.sleep_total_duration_minutes == 480
+        assert detail.is_nap is False
+
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    def test_session_just_under_threshold_is_nap(
+        self,
+        mock_delete_state: MagicMock,
+        mock_event_service: MagicMock,
+        db: Session,
+    ) -> None:
+        """A session with 179 minutes of actual sleep (just under the 180 min
+        threshold) should be classified as a nap."""
+        user_id = str(uuid4())
+        mock_record = MagicMock()
+        mock_record.id = uuid4()
+        mock_event_service.create.return_value = mock_record
+        mock_event_service.find_adjacent_sleep_record.return_value = None
+
+        state = SleepState(
+            uuid=str(uuid4()),
+            source_name="Apple Watch",
+            device_model="Watch7,1",
+            provider="apple",
+            start_time=_dt("2026-03-15T13:00:00Z"),
+            end_time=_dt("2026-03-15T15:59:00Z"),
+            last_start_timestamp=_dt("2026-03-15T13:00:00Z"),
+            last_end_timestamp=_dt("2026-03-15T15:59:00Z"),
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.SLEEPING,
+                    start_time=_dt("2026-03-15T13:00:00Z"),
+                    end_time=_dt("2026-03-15T15:59:00Z"),
+                ),
+            ],
+        )
+
+        finish_sleep(db, user_id, state)
+
+        detail = mock_event_service.create_detail.call_args[0][1]
+        assert detail.sleep_total_duration_minutes == 179
+        assert detail.is_nap is True
+
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.delete_sleep_state")
+    def test_session_exactly_at_threshold_is_not_nap(
+        self,
+        mock_delete_state: MagicMock,
+        mock_event_service: MagicMock,
+        db: Session,
+    ) -> None:
+        """A session with exactly 180 minutes of actual sleep sits at the
+        documented boundary and should NOT be classified as a nap (the
+        heuristic is a strict `<` comparison, so 180 min itself counts as
+        real sleep)."""
+        user_id = str(uuid4())
+        mock_record = MagicMock()
+        mock_record.id = uuid4()
+        mock_event_service.create.return_value = mock_record
+        mock_event_service.find_adjacent_sleep_record.return_value = None
+
+        state = SleepState(
+            uuid=str(uuid4()),
+            source_name="Apple Watch",
+            device_model="Watch7,1",
+            provider="apple",
+            start_time=_dt("2026-03-15T13:00:00Z"),
+            end_time=_dt("2026-03-15T16:00:00Z"),
+            last_start_timestamp=_dt("2026-03-15T13:00:00Z"),
+            last_end_timestamp=_dt("2026-03-15T16:00:00Z"),
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.SLEEPING,
+                    start_time=_dt("2026-03-15T13:00:00Z"),
+                    end_time=_dt("2026-03-15T16:00:00Z"),
+                ),
+            ],
+        )
+
+        finish_sleep(db, user_id, state)
+
+        detail = mock_event_service.create_detail.call_args[0][1]
+        assert detail.sleep_total_duration_minutes == 180
+        assert detail.is_nap is False
+
+
 class TestHandleSleepDataIntegration:
     """Integration tests for handle_sleep_data with real payload structures."""
 
