@@ -9,6 +9,7 @@ Apple Watch sleep data patterns:
 - Newer Apple Watch (watchOS 9+): "in_bed", "awake", "light", "deep", "rem" stages
 """
 
+import json
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -960,3 +961,108 @@ class TestFinishSleepPersistenceFailureRaises:
         # replacement never made it into the DB, so deleting it would have
         # lost data with nothing to replace it (the OW-03 bug).
         mock_event_service.delete.assert_not_called()
+
+
+class TestMissingZoneOffsetIsLoggedNotRejected:
+    """OW-05: zoneOffset is optional on the wire (older SDK builds may not
+    send it yet), so a batch missing it must still succeed — silently
+    defaulting the wake date to UTC is the actual bug, not something to fix
+    by rejecting the batch. This just makes the gap observable.
+    """
+
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    def test_missing_zone_offset_logs_warning_but_still_processes(
+        self,
+        mock_redis_func: MagicMock,
+        mock_event_service: MagicMock,
+        mock_finalize: MagicMock,
+        db: Session,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        user_id = str(uuid4())
+        mock_redis = MagicMock()
+        mock_redis.get.return_value = None
+        mock_redis_func.return_value = mock_redis
+        mock_event_service.find_adjacent_sleep_record.return_value = None
+
+        request = SyncRequest.model_validate(OLD_WATCH_PAYLOAD)
+        assert all(s.zoneOffset is None for s in request.data.sleep), "fixture must have no zoneOffset for this test"
+
+        # Must not raise despite every sample missing zoneOffset.
+        handle_sleep_data(db, request, user_id)
+
+        # log_structured prints structured JSON directly to stdout rather than
+        # going through the stdlib logger — parse it back out.
+        out = capsys.readouterr().out
+        logged = [json.loads(line) for line in out.strip().splitlines() if line.strip().startswith("{")]
+        missing_offset_logs = [entry for entry in logged if entry.get("action") == "sleep_missing_zone_offset"]
+        assert missing_offset_logs, f"expected a sleep_missing_zone_offset log entry, got: {logged}"
+        assert missing_offset_logs[0]["count"] == len(request.data.sleep)
+
+
+class TestSleepStateZoneOffsetTracksSessionEnd:
+    """OW-10: the session's zone_offset must reflect the sample that extends
+    the session's *end* (what every wake-date calculation keys off), not
+    whichever sample happened to arrive first. A session spanning a
+    timezone change (travel, DST) previously kept the first sample's offset
+    for the whole night.
+    """
+
+    @patch("app.integrations.celery.tasks.finalize_stale_sleep_task.finalize_stale_sleeps")
+    @patch("app.services.apple.healthkit.sleep_service.event_record_service")
+    @patch("app.services.apple.healthkit.sleep_service.get_redis_client")
+    def test_later_sample_offset_wins_when_it_extends_the_session_end(
+        self,
+        mock_redis_func: MagicMock,
+        mock_event_service: MagicMock,
+        mock_finalize: MagicMock,
+        db: Session,
+    ) -> None:
+        user_id = str(uuid4())
+
+        payload = {
+            "provider": "apple",
+            "sdkVersion": "1.0.0",
+            "syncTimestamp": "2026-03-11T13:28:04Z",
+            "data": {
+                "records": [],
+                "workouts": [],
+                "sleep": [
+                    {
+                        "id": "bbbb0000-0000-0000-0000-000000000001",
+                        "parentId": None,
+                        "stage": "sleeping",
+                        "startDate": "2026-03-10T23:00:00Z",
+                        "endDate": "2026-03-11T02:00:00Z",
+                        "zoneOffset": "-05:00",  # user's home tz at bedtime
+                        "source": {"device_type": "watch", "device_model": "Watch3,3"},
+                    },
+                    {
+                        "id": "bbbb0000-0000-0000-0000-000000000002",
+                        "parentId": None,
+                        "stage": "sleeping",
+                        "startDate": "2026-03-11T02:05:00Z",
+                        "endDate": "2026-03-11T06:00:00Z",
+                        "zoneOffset": "-08:00",  # landed on a later flight before waking
+                        "source": {"device_type": "watch", "device_model": "Watch3,3"},
+                    },
+                ],
+            },
+        }
+
+        mock_redis = MagicMock()
+        mock_redis.get.return_value = None
+        mock_redis_func.return_value = mock_redis
+        mock_event_service.find_adjacent_sleep_record.return_value = None
+
+        handle_sleep_data(db, SyncRequest.model_validate(payload), user_id)
+
+        last_set_call = mock_redis.set.call_args_list[-1]
+        state = SleepState.model_validate_json(last_set_call[0][1])
+
+        # The session's offset must be the wake-time (-08:00) sample's, not
+        # the bedtime (-05:00) sample's — that's what the wake date is
+        # computed from everywhere downstream.
+        assert state.zone_offset == "-08:00"

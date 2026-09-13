@@ -64,6 +64,21 @@ class ImportService:
         user_uuid = UUID(user_id)
         provider = request.provider
 
+        # Fix OW-05: zoneOffset is optional on the wire, and every downstream
+        # date derivation (event_record_repository, fill_missing_sleep_scores,
+        # etc.) defaults a missing one to UTC — silently shifting a record by
+        # up to a day for any non-UTC user. Not making the field required:
+        # older SDK builds may not send it yet, and rejecting their whole
+        # batch would be a bigger regression than the bug. Log so the gap is
+        # measurable instead.
+        missing_offset = sum(1 for wjson in request.data.workouts if not wjson.zoneOffset)
+        if missing_offset:
+            log_structured(
+                self.log, "warning", f"{missing_offset} workout(s) missing zoneOffset",
+                action="workout_missing_zone_offset", provider=provider,
+                user_id=user_id, count=missing_offset, total=len(request.data.workouts),
+            )
+
         for wjson in request.data.workouts:
             workout_id = uuid4()
             external_id = wjson.id if wjson.id else None
@@ -138,6 +153,15 @@ class ImportService:
         time_series_samples: list[HeartRateSampleCreate | StepSampleCreate | TimeSeriesSampleCreate] = []
         user_uuid = UUID(user_id)
         provider = request.provider
+
+        # Fix OW-05 — see the identical note in _build_workout_bundles.
+        missing_offset = sum(1 for rjson in request.data.records if not rjson.zoneOffset)
+        if missing_offset:
+            log_structured(
+                self.log, "warning", f"{missing_offset} record(s) missing zoneOffset",
+                action="record_missing_zone_offset", provider=provider,
+                user_id=user_id, count=missing_offset, total=len(request.data.records),
+            )
 
         for rjson in request.data.records:
             value = Decimal(str(rjson.value))

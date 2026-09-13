@@ -149,9 +149,6 @@ def _apply_transition(
         finish_sleep(db_session, user_id, state)
         state = _create_new_sleep_state(start_time, end_time, uuid, provider, source_name, device_model, zone_offset)
 
-    if zone_offset and not state.zone_offset:
-        state.zone_offset = zone_offset
-
     duration_seconds = (end_time - start_time).total_seconds()
 
     stage_label: SleepStageType
@@ -180,6 +177,16 @@ def _apply_transition(
 
     if end_time > state.end_time:
         state.end_time = end_time
+        # Fix OW-10: adopt this sample's offset as the session's offset only
+        # when it's the one extending the session's *end* — that's the
+        # instant every downstream wake-date calculation actually cares
+        # about (end_datetime + zone_offset). Previously the FIRST sample's
+        # offset was locked in for the whole session, so a session spanning
+        # a timezone change (travel, DST) kept the wrong offset for the
+        # night's real wake date. A sample with no offset never overwrites
+        # one we already have.
+        if zone_offset:
+            state.zone_offset = zone_offset
     elif start_time < state.start_time:
         state.start_time = start_time
 
@@ -262,6 +269,17 @@ def handle_sleep_data(
             if key_tuple not in seen:
                 seen.add(key_tuple)
                 unique_data.append(item)
+
+        # Fix OW-05: zoneOffset is optional on the wire, and every downstream
+        # wake-date derivation defaults a missing one to UTC — see the
+        # identical note in import_service.py's workout/record bundlers.
+        missing_offset = sum(1 for item in unique_data if not item.zoneOffset)
+        if missing_offset:
+            log_structured(
+                logger, "warning", f"{missing_offset} sleep sample(s) missing zoneOffset",
+                action="sleep_missing_zone_offset", provider=provider,
+                user_id=user_id, count=missing_offset, total=len(unique_data),
+            )
 
         for sjson in unique_data:
             # Extract device info
