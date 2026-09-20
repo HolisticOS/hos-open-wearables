@@ -52,6 +52,18 @@ class ImportService:
     def _dec(self, value: float | int | Decimal | None) -> Decimal | None:
         return None if value is None else Decimal(str(value))
 
+    @staticmethod
+    def _batch_zone_offset(offsets: Iterable[str | None]) -> str | None:
+        """The first non-null zoneOffset in a sync batch.
+
+        A batch is one device's sync of its own local samples, so any record
+        that does carry an offset is a good stand-in for a sibling record
+        that doesn't — better than the '+00:00' every downstream date
+        derivation falls back to (see the OW-05 note above), which silently
+        shifts a record by up to a day for any non-UTC user.
+        """
+        return next((o for o in offsets if o), None)
+
     def _build_workout_bundles(
         self,
         request: SDKSyncRequest,
@@ -78,10 +90,12 @@ class ImportService:
                 action="workout_missing_zone_offset", provider=provider,
                 user_id=user_id, count=missing_offset, total=len(request.data.workouts),
             )
+        batch_offset = self._batch_zone_offset(w.zoneOffset for w in request.data.workouts)
 
         for wjson in request.data.workouts:
             workout_id = uuid4()
             external_id = wjson.id if wjson.id else None
+            zone_offset = wjson.zoneOffset or batch_offset
 
             device_model, software_version, original_source_name = extract_device_info(wjson.source)
 
@@ -91,7 +105,7 @@ class ImportService:
                 device_model,
                 software_version,
                 wjson.endDate,
-                wjson.zoneOffset,
+                zone_offset,
                 provider,
                 original_source_name,
             )
@@ -110,7 +124,7 @@ class ImportService:
                 duration_seconds=int(duration),
                 start_datetime=wjson.startDate,
                 end_datetime=wjson.endDate,
-                zone_offset=wjson.zoneOffset,
+                zone_offset=zone_offset,
                 id=workout_id,
                 external_id=external_id,
                 source=original_source_name,
@@ -162,6 +176,12 @@ class ImportService:
                 action="record_missing_zone_offset", provider=provider,
                 user_id=user_id, count=missing_offset, total=len(request.data.records),
             )
+        # A missing zoneOffset otherwise falls through to
+        # get_daily_activity_aggregates' COALESCE(zone_offset, '+00:00') —
+        # bucketing this record (steps, most commonly) under its UTC date
+        # instead of the device's actual local date. A sibling record from
+        # the same sync batch is a far better stand-in than UTC.
+        batch_offset = self._batch_zone_offset(r.zoneOffset for r in request.data.records)
 
         for rjson in request.data.records:
             value = Decimal(str(rjson.value))
@@ -185,7 +205,7 @@ class ImportService:
                 software_version=software_version,
                 provider=provider,
                 recorded_at=rjson.startDate,
-                zone_offset=rjson.zoneOffset,
+                zone_offset=rjson.zoneOffset or batch_offset,
                 value=value,
                 series_type=series_type,
                 is_daily_total=daily_total_flag(series_type, is_daily=False),
