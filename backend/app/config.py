@@ -235,6 +235,65 @@ class Settings(BaseSettings):
             self.oura_webhook_verification_token = SecretStr(self.secret_key)
         return self
 
+    # Platform env injection (Railway, Compose, Kubernetes) writes an EMPTY
+    # STRING for a variable that exists but was never given a value. Pydantic
+    # then parses "" against the field type, and a typed field blows up at
+    # import time — before any logging exists, taking the process with it.
+    #
+    # That is exactly how an unset DB_PORT crash-looped celery beat in
+    # production: `db_port: int` could not parse "", while the str fields right
+    # beside it (DB_HOST, DB_NAME, DB_USER) accepted "" in silence. The result
+    # was a pydantic int_parsing traceback that named the one typed field and
+    # said nothing about the four blank ones next to it.
+    #
+    # Blank means unset — the same reading the derive_* validators above
+    # already apply to the webhook secrets.
+    @field_validator(
+        "db_host",
+        "db_port",
+        "db_name",
+        "db_user",
+        "db_password",
+        "redis_host",
+        "redis_port",
+        "redis_db",
+        mode="before",
+    )
+    @classmethod
+    def _blank_means_unset(cls, v: Any, validation_info: ValidationInfo) -> Any:
+        if isinstance(v, str) and not v.strip():
+            field_name = validation_info.field_name
+            if field_name is not None:
+                return cls.model_fields[field_name].default
+        return v
+
+    # With blank treated as unset, a production deploy that never got its
+    # database settings would fall back to the compose-local defaults and fail
+    # at connect time instead of at boot — quieter, but no more correct. Say so
+    # plainly here rather than letting it surface later as a DNS error for the
+    # host "db".
+    @model_validator(mode="after")
+    def _require_real_database_in_production(self) -> "Settings":
+        if self.environment != EnvironmentType.PRODUCTION:
+            return self
+        unset = [
+            env_name
+            for env_name, value, default in (
+                ("DB_HOST", self.db_host, "db"),
+                ("DB_NAME", self.db_name, "open-wearables"),
+                ("DB_USER", self.db_user, "open-wearables"),
+                ("DB_PASSWORD", self.db_password.get_secret_value(), "open-wearables"),
+            )
+            if value == default
+        ]
+        if unset:
+            raise ValueError(
+                "ENVIRONMENT=production but these database settings are unset "
+                f"(or blank) and fell back to their local defaults: {', '.join(unset)}. "
+                "Set them on the service before deploying."
+            )
+        return self
+
     @field_validator("cors_origins", mode="after")
     @classmethod
     def assemble_cors_origins(cls, v: str | list[str]) -> list[str] | str:
