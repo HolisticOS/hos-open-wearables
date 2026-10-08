@@ -35,6 +35,43 @@ from app.utils.pagination import decode_cursor
 DataSourceIdentity = tuple[UUID, str | None, str | None]
 
 
+def local_date_expr(
+    recorded_at: ColumnElement,
+    zone_offset: ColumnElement,
+    timezone_name: str | None = None,
+) -> ColumnElement:
+    """The calendar day a sample belongs to, in the wearer's own day.
+
+    Three sources of truth, in descending order of how much they know:
+
+    1. The sample's own ``zone_offset``, written at ingest. Best, because it
+       is what the device was actually set to at that moment, so it survives
+       both travel and a DST change mid-window.
+    2. ``timezone_name``, the user's registered IANA zone, when the caller
+       knows it. DST-correct, because Postgres resolves the name against the
+       instant rather than against a fixed offset.
+    3. UTC.
+
+    Step 3 used to be the *only* behaviour: ``COALESCE(zone_offset, '+00:00')``.
+    Only about a quarter of step samples carry an offset today, so for the
+    other three quarters every sample was filed on its UTC day. For anyone
+    west of Greenwich that moved the evening onto tomorrow — a New York member
+    had everything after 8pm counted against the next day, so "today" could be
+    made up entirely of last night.
+
+    Both branches evaluate to ``timestamp without time zone`` (a wall clock),
+    so the CASE is type-consistent and the cast to Date cannot be re-read
+    through the session timezone.
+    """
+    utc_wall = func.timezone("UTC", recorded_at)
+    with_offset = utc_wall + cast(zone_offset, Interval)
+    fallback = func.timezone(timezone_name, recorded_at) if timezone_name else utc_wall
+    return cast(
+        case((zone_offset.isnot(None), with_offset), else_=fallback),
+        Date,
+    )
+
+
 class WriteCounts(int):
     """Result of a bulk upsert: total rows written, split into new vs updated.
 
@@ -540,6 +577,7 @@ class DataPointSeriesRepository(
         user_id: UUID,
         start_date: datetime,
         end_date: datetime,
+        timezone_name: str | None = None,
     ) -> list[ActivityAggregateResult]:
         """Get daily activity aggregates from time-series data.
 
@@ -560,10 +598,7 @@ class DataPointSeriesRepository(
         flights_id = get_series_type_id(SeriesType.flights_climbed)
         active_time_id = get_series_type_id(SeriesType.active_time)
 
-        local_date = cast(
-            self.model.recorded_at + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
-            Date,
-        )
+        local_date = local_date_expr(self.model.recorded_at, self.model.zone_offset, timezone_name)
 
         def prefer_daily_sum(series_id: int) -> ColumnElement:
             """Per (day, source): use the daily-total rows if any exist, else sum samples.
@@ -671,6 +706,7 @@ class DataPointSeriesRepository(
         start_date: datetime,
         end_date: datetime,
         active_threshold: int = 30,
+        timezone_name: str | None = None,
     ) -> list[ActiveMinutesResult]:
         """Get daily active/sedentary minutes from step data.
 
@@ -688,10 +724,7 @@ class DataPointSeriesRepository(
         """
         steps_id = get_series_type_id(SeriesType.steps)
 
-        local_date = cast(
-            self.model.recorded_at + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
-            Date,
-        )
+        local_date = local_date_expr(self.model.recorded_at, self.model.zone_offset, timezone_name)
 
         # Create minute bucket expression using literal 'minute' text
         minute_trunc = func.date_trunc(literal_column("'minute'"), self.model.recorded_at)
@@ -773,6 +806,7 @@ class DataPointSeriesRepository(
         light_max: int,
         moderate_max: int,
         vigorous_max: int,
+        timezone_name: str | None = None,
     ) -> list[IntensityMinutesResult]:
         """Get daily intensity minutes from heart rate data.
 
@@ -791,10 +825,7 @@ class DataPointSeriesRepository(
         """
         hr_id = get_series_type_id(SeriesType.heart_rate)
 
-        local_date = cast(
-            self.model.recorded_at + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
-            Date,
-        )
+        local_date = local_date_expr(self.model.recorded_at, self.model.zone_offset, timezone_name)
 
         # Create minute bucket expression
         minute_trunc = func.date_trunc(literal_column("'minute'"), self.model.recorded_at)

@@ -1578,3 +1578,97 @@ class TestRecoverySummaryEndpoint:
         assert len(data["data"]) == 3
         assert data["pagination"]["has_more"] is True
         assert data["pagination"]["next_cursor"] is not None
+
+
+class TestActivitySummaryTimezone:
+    """The day a step sample is counted against.
+
+    Regression cover for the bucketing bug: with no zone offset on the sample
+    and no timezone from the caller, every sample was filed on its UTC day.
+    A New York member walking at 9pm had those steps counted against the next
+    day, so "today" could be made up entirely of last night.
+    """
+
+    @staticmethod
+    def _evening_steps(user, *, zone_offset=None):
+        """900 steps at 2026-10-07 21:00 New York = 2026-10-08 01:00 UTC."""
+        mapping = DataSourceFactory(user=user, source="apple")
+        steps_type = SeriesTypeDefinitionFactory.get_or_create_steps()
+        DataPointSeriesFactory(
+            mapping=mapping,
+            series_type=steps_type,
+            value=Decimal("900"),
+            recorded_at=datetime(2026, 10, 8, 1, 0, 0, tzinfo=timezone.utc),
+            zone_offset=zone_offset,
+        )
+
+    @staticmethod
+    def _get(client, user, api_key, **params):
+        return client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(api_key.id),
+            params={
+                "start_date": "2026-10-06T00:00:00Z",
+                "end_date": "2026-10-10T00:00:00Z",
+                **params,
+            },
+        )
+
+    def test_timezone_puts_evening_steps_on_the_evening(self, client: TestClient, db: Session) -> None:
+        user = UserFactory()
+        self._evening_steps(user)
+        api_key = ApiKeyFactory()
+
+        response = self._get(client, user, api_key, timezone="America/New_York")
+
+        assert response.status_code == 200
+        rows = response.json()["data"]
+        assert len(rows) == 1
+        assert rows[0]["date"] == "2026-10-07", "9pm Tuesday belongs to Tuesday"
+        assert rows[0]["steps"] == 900
+
+    def test_without_a_timezone_it_still_falls_back_to_utc(self, client: TestClient, db: Session) -> None:
+        # Unchanged behaviour for callers that send no timezone — the fix is
+        # opt-in per request, so nothing that already worked moves.
+        user = UserFactory()
+        self._evening_steps(user)
+        api_key = ApiKeyFactory()
+
+        rows = self._get(client, user, api_key).json()["data"]
+
+        assert len(rows) == 1
+        assert rows[0]["date"] == "2026-10-08"
+
+    def test_the_samples_own_offset_beats_the_requested_timezone(self, client: TestClient, db: Session) -> None:
+        # The device knew where it was. A member who flew to London keeps the
+        # offset their watch recorded, not the zone on their profile.
+        user = UserFactory()
+        self._evening_steps(user, zone_offset="+01:00")
+        api_key = ApiKeyFactory()
+
+        rows = self._get(client, user, api_key, timezone="America/New_York").json()["data"]
+
+        assert len(rows) == 1
+        assert rows[0]["date"] == "2026-10-08", "01:00 UTC + 1h is still the 8th"
+
+    def test_a_positive_offset_zone_moves_the_other_way(self, client: TestClient, db: Session) -> None:
+        # 01:00 UTC is already mid-morning in Tokyo, so the day rolls forward
+        # rather than back. Guards against a fix that only ever subtracts.
+        user = UserFactory()
+        self._evening_steps(user)
+        api_key = ApiKeyFactory()
+
+        rows = self._get(client, user, api_key, timezone="Asia/Tokyo").json()["data"]
+
+        assert len(rows) == 1
+        assert rows[0]["date"] == "2026-10-08"
+
+    def test_an_unknown_timezone_is_rejected_not_ignored(self, client: TestClient, db: Session) -> None:
+        # Silently ignoring it would hand back UTC days that look correct.
+        user = UserFactory()
+        self._evening_steps(user)
+        api_key = ApiKeyFactory()
+
+        response = self._get(client, user, api_key, timezone="Mars/Olympus_Mons")
+
+        assert response.status_code == 422

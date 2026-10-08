@@ -456,6 +456,7 @@ class SummariesService:
         cursor: str | None,
         limit: int,
         sort_order: str = "asc",
+        timezone_name: str | None = None,
     ) -> PaginatedResponse[ActivitySummary]:
         """Get daily activity summaries aggregated by date, provider, and device.
 
@@ -473,7 +474,9 @@ class SummariesService:
         self.logger.debug(f"Fetching activity summaries for user {user_id} from {start_date} to {end_date}")
 
         # Get aggregated data from time-series repository (live data)
-        results = self.data_point_repo.get_daily_activity_aggregates(db_session, user_id, start_date, end_date)
+        results = self.data_point_repo.get_daily_activity_aggregates(
+            db_session, user_id, start_date, end_date, timezone_name=timezone_name
+        )
 
         # Merge archived data when archival is enabled
         results = self._merge_archive_activity(db_session, user_id, start_date, end_date, results)
@@ -494,7 +497,8 @@ class SummariesService:
 
         # Get active/sedentary minutes from step data
         activity_minutes = self.data_point_repo.get_daily_active_minutes(
-            db_session, user_id, start_date, end_date, active_threshold=ACTIVE_STEPS_THRESHOLD
+            db_session, user_id, start_date, end_date, active_threshold=ACTIVE_STEPS_THRESHOLD,
+            timezone_name=timezone_name
         )
 
         # Build lookup for activity minutes
@@ -516,6 +520,7 @@ class SummariesService:
             light_max=hr_zones["light_max"],
             moderate_max=hr_zones["moderate_max"],
             vigorous_max=hr_zones["vigorous_max"],
+            timezone_name=timezone_name,
         )
 
         # Build lookup for intensity minutes

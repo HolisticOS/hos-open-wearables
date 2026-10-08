@@ -1,7 +1,8 @@
 from typing import Annotated
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from app.database import DbSession
 from app.schemas.responses.activity import (
@@ -29,15 +30,27 @@ def get_activity_summary(
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=400)] = 50,
     sort_order: Annotated[str, Query(pattern="^(asc|desc)$")] = "asc",
+    timezone: Annotated[str | None, Query(description="IANA timezone, e.g. America/New_York")] = None,
 ) -> PaginatedResponse[ActivitySummary]:
     """Returns daily aggregated activity metrics.
 
     Aggregates time-series data (steps, energy, heart rate, etc.) by day.
+
+    `timezone` decides which day a sample belongs to when the sample itself
+    carries no zone offset — only about a quarter of step samples do. Without
+    it those fall back to UTC, which files a negative-offset user's evening
+    under the following day. Pass the wearer's own IANA zone whenever the
+    caller knows it; an unknown name is rejected rather than silently ignored.
     """
+    if timezone is not None:
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=f"Unknown timezone: {timezone}") from exc
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_datetime(end_date)
     return summaries_service.get_activity_summaries(
-        db, user_id, start_datetime, end_datetime, cursor, limit, sort_order
+        db, user_id, start_datetime, end_datetime, cursor, limit, sort_order, timezone_name=timezone
     )
 
 
