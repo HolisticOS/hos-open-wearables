@@ -61,6 +61,8 @@ AGGREGATION_METHOD_BY_TYPE: dict[SeriesType, AggregationMethod] = {
     SeriesType.flights_climbed: AggregationMethod.SUM,
     SeriesType.average_met: AggregationMethod.AVG,
     SeriesType.active_time: AggregationMethod.SUM,
+    SeriesType.intensity_minutes_moderate: AggregationMethod.SUM,
+    SeriesType.intensity_minutes_vigorous: AggregationMethod.SUM,
     # ── Activity — Distance ──
     SeriesType.distance_walking_running: AggregationMethod.SUM,
     SeriesType.distance_cycling: AggregationMethod.SUM,

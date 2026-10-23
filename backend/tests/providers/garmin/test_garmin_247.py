@@ -527,8 +527,8 @@ class TestGarmin247Data:
         normalized, _ = garmin_247.normalize_dailies(sample_daily, user_id)
         samples = garmin_247._build_dailies_samples(user_id, normalized)
 
-        # 5 metrics (steps, calories, resting_hr, floors, distance) + 3 HR samples
-        assert len(samples) == 8
+        # 6 metrics (steps, calories, resting_hr, floors, distance, bmr) + 3 HR samples
+        assert len(samples) == 9
         assert len({s.series_type for s in samples}) > 1
 
     def test_build_dailies_samples_empty_on_missing_date(self, garmin_247: Garmin247Data) -> None:
@@ -544,8 +544,8 @@ class TestGarmin247Data:
         normalized = garmin_247.normalize_epochs([sample_epoch], user_id)
         samples = garmin_247._build_epochs_samples(user_id, normalized)
 
-        # 1 heart_rate + 1 steps + 1 energy = 3
-        assert len(samples) == 3
+        # 1 heart_rate + 1 steps + 1 energy + 1 distance = 4
+        assert len(samples) == 4
 
     def test_build_body_comp_samples(self, garmin_247: Garmin247Data, sample_body_comp: dict[str, Any]) -> None:
         """Test _build_body_comp_samples returns samples without DB call."""
@@ -569,8 +569,9 @@ class TestGarmin247Data:
         user_id = uuid4()
         samples = garmin_247._build_blood_pressure_samples(user_id, sample_blood_pressure)
 
-        assert len(samples) == 2  # systolic + diastolic
+        assert len(samples) == 3  # systolic + diastolic + pulse
         by_type = {s.series_type: s for s in samples}
+        assert by_type[SeriesType.heart_rate].value == Decimal("69")
         assert by_type[SeriesType.blood_pressure_systolic].value == Decimal("112")
         assert by_type[SeriesType.blood_pressure_diastolic].value == Decimal("73")
 

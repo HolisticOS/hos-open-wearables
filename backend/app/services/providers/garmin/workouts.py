@@ -184,6 +184,16 @@ class GarminWorkouts(BaseWorkoutsTemplate):
 
         average_cadence = Decimal(str(raw_workout.averageCadence)) if raw_workout.averageCadence is not None else None
 
+        average_speed = (
+            Decimal(str(raw_workout.averageSpeedInMetersPerSecond))
+            if raw_workout.averageSpeedInMetersPerSecond is not None
+            else None
+        )
+
+        total_elevation_gain = (
+            Decimal(str(raw_workout.elevationGainInMeters)) if raw_workout.elevationGainInMeters is not None else None
+        )
+
         return {
             # Garmin activity payloads carry only average and max heart rate
             "heart_rate_min": None,
@@ -193,6 +203,8 @@ class GarminWorkouts(BaseWorkoutsTemplate):
             "energy_burned": energy_burned,
             "distance": distance,
             "average_cadence": average_cadence,
+            "average_speed": average_speed,
+            "total_elevation_gain": total_elevation_gain,
         }
 
     def _normalize_workout(

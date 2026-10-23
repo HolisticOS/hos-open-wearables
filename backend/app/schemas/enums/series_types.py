@@ -81,6 +81,8 @@ class SeriesType(str, Enum):
     flights_climbed = "flights_climbed"
     average_met = "average_met"
     active_time = "active_time"  # Provider-reported daily active time (non-sedentary)
+    intensity_minutes_moderate = "intensity_minutes_moderate"  # Provider-reported moderate intensity minutes
+    intensity_minutes_vigorous = "intensity_minutes_vigorous"  # Provider-reported vigorous intensity minutes
 
     # =========================================================================
     # ACTIVITY - Distance (IDs 100-119)
@@ -233,6 +235,8 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     (86, SeriesType.flights_climbed, "count"),
     (87, SeriesType.average_met, "met"),
     (88, SeriesType.active_time, "minutes"),
+    (89, SeriesType.intensity_minutes_moderate, "minutes"),
+    (90, SeriesType.intensity_minutes_vigorous, "minutes"),
     # -------------------------------------------------------------------------
     # ACTIVITY - Distance (IDs 100-119)
     # -------------------------------------------------------------------------

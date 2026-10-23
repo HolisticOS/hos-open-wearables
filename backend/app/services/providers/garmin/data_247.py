@@ -8,6 +8,7 @@ from uuid import UUID, uuid4
 
 from app.config import settings
 from app.constants.sleep import SleepStageType
+from app.constants.workout_types.garmin import get_unified_workout_type
 from app.database import DbSession
 from app.models import DataPointSeries, EventRecord, EventRecordDetail
 from app.repositories import (
@@ -17,7 +18,8 @@ from app.repositories import (
     UserConnectionRepository,
 )
 from app.repositories.data_point_series_repository import DataPointSeriesRepository
-from app.schemas.enums import HealthScoreCategory, ProviderName, SeriesType, daily_total_flag
+from app.schemas.enums import AggregationMethod, HealthScoreCategory, ProviderName, SeriesType, daily_total_flag
+from app.schemas.enums.aggregation_method import get_aggregation_method
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -86,6 +88,11 @@ class Garmin247Data(Base247DataTemplate):
     def _from_epoch_seconds(self, ts: int) -> datetime:
         """Convert UTC Unix timestamp (seconds) to datetime."""
         return datetime.fromtimestamp(ts, tz=timezone.utc)
+
+    @staticmethod
+    def _seconds_to_minutes(seconds: int | float | None) -> int | None:
+        """Whole minutes from a Garmin duration in seconds; None when the field is absent."""
+        return int(seconds) // 60 if seconds is not None else None
 
     def _make_api_request(
         self,
@@ -434,6 +441,13 @@ class Garmin247Data(Base247DataTemplate):
         stress_qualifier = raw_qualifier.replace("_", " ").title() if raw_qualifier else None
         # averageStressLevel is -1 when there is not enough data to calculate
         if avg_stress is not None and avg_stress != -1:
+            components: dict[str, ScoreComponent] = {}
+            max_stress = normalized_daily.get("max_stress")
+            if max_stress is not None and max_stress >= 0:
+                components["max_stress_level"] = ScoreComponent(value=max_stress)
+            for level, seconds in (normalized_daily.get("stress_durations_seconds") or {}).items():
+                if seconds is not None and seconds >= 0:
+                    components[f"{level}_stress_duration_seconds"] = ScoreComponent(value=seconds)
             scores.append(
                 HealthScoreCreate(
                     id=uuid4(),
@@ -443,6 +457,8 @@ class Garmin247Data(Base247DataTemplate):
                     value=avg_stress,
                     qualifier=stress_qualifier,
                     recorded_at=recorded_at,
+                    zone_offset=normalized_daily.get("zone_offset"),
+                    components=components or None,
                 )
             )
 
@@ -472,8 +488,16 @@ class Garmin247Data(Base247DataTemplate):
             "avg_stress": raw_daily.get("averageStressLevel"),
             "max_stress": raw_daily.get("maxStressLevel"),
             "stress_qualifier": raw_daily.get("stressQualifier"),
-            "moderate_intensity_minutes": (raw_daily.get("moderateIntensityDurationInSeconds") or 0) // 60,
-            "vigorous_intensity_minutes": (raw_daily.get("vigorousIntensityDurationInSeconds") or 0) // 60,
+            # None (not 0) when Garmin omits the field, so an absent value is not stored as zero minutes.
+            "moderate_intensity_minutes": self._seconds_to_minutes(raw_daily.get("moderateIntensityDurationInSeconds")),
+            "vigorous_intensity_minutes": self._seconds_to_minutes(raw_daily.get("vigorousIntensityDurationInSeconds")),
+            "stress_durations_seconds": {
+                "rest": raw_daily.get("restStressDurationInSeconds"),
+                "low": raw_daily.get("lowStressDurationInSeconds"),
+                "medium": raw_daily.get("mediumStressDurationInSeconds"),
+                "high": raw_daily.get("highStressDurationInSeconds"),
+                "activity": raw_daily.get("activityStressDurationInSeconds"),
+            },
             "active_time": active_seconds // 60 if active_seconds is not None else None,
             "heart_rate_samples": raw_daily.get("timeOffsetHeartRateSamples"),
             "garmin_summary_id": raw_daily.get("summaryId"),
@@ -613,6 +637,11 @@ class Garmin247Data(Base247DataTemplate):
     ) -> dict[str, list[dict[str, Any]]]:
         """Normalize epoch data into categorized samples.
 
+        Garmin sends one epoch per activity type for each 15-minute slot, all sharing the
+        slot's ``startTimeInSeconds``. Samples land on one row per (series type, timestamp),
+        so epochs of the same slot are merged here: summable values (steps, calories,
+        distance, active time) are added up, the others (heart rate, MET) are averaged.
+
         Args:
             raw_epochs: List of raw epoch data from API
             user_id: User ID
@@ -620,9 +649,8 @@ class Garmin247Data(Base247DataTemplate):
         Returns:
             Dict with keys like 'heart_rate', 'steps', etc.
         """
-        heart_rate_samples: list[dict[str, Any]] = []
-        step_samples: list[dict[str, Any]] = []
-        energy_samples: list[dict[str, Any]] = []
+        # category -> timestamp -> (sample, values seen in that slot)
+        merged: dict[str, dict[str, tuple[dict[str, Any], list[Any]]]] = {key: {} for key in EPOCHS_SERIES}
 
         for epoch in raw_epochs:
             start_ts = epoch.get("startTimeInSeconds", 0)
@@ -642,47 +670,40 @@ class Garmin247Data(Base247DataTemplate):
                 summary_id.rpartition("-")[0] if summary_id and summary_id.count("-") >= 2 else summary_id
             )
 
-            # Heart rate
             mean_hr = epoch.get("meanHeartRateInBeatsPerMinute")
-            if mean_hr:
-                heart_rate_samples.append(
-                    {
-                        "timestamp": recorded_at.isoformat(),
-                        "value": mean_hr,
-                        "zone_offset": zone_offset,
-                        "external_id": slot_external_id,
-                    }
-                )
+            active_seconds = epoch.get("activeTimeInSeconds")
+            values: dict[str, Any] = {
+                "heart_rate": mean_hr or None,  # 0 means no reading, not a heart rate of 0
+                "steps": epoch.get("steps"),
+                "energy": epoch.get("activeKilocalories"),
+                "distance": epoch.get("distanceInMeters"),
+                "active_time": Decimal(str(active_seconds)) / 60 if active_seconds is not None else None,
+                "met": epoch.get("met"),
+            }
 
-            # Steps
-            steps = epoch.get("steps")
-            if steps is not None:
-                step_samples.append(
-                    {
-                        "timestamp": recorded_at.isoformat(),
-                        "value": steps,
-                        "zone_offset": zone_offset,
-                        "external_id": slot_external_id,
-                    }
-                )
+            timestamp = recorded_at.isoformat()
+            for key, value in values.items():
+                if value is None:
+                    continue
+                slot = merged[key].get(timestamp)
+                if slot is None:
+                    sample = {"timestamp": timestamp, "zone_offset": zone_offset, "external_id": slot_external_id}
+                    merged[key][timestamp] = (sample, [value])
+                else:
+                    slot[1].append(value)
 
-            # Active calories
-            calories = epoch.get("activeKilocalories")
-            if calories is not None:
-                energy_samples.append(
-                    {
-                        "timestamp": recorded_at.isoformat(),
-                        "value": calories,
-                        "zone_offset": zone_offset,
-                        "external_id": slot_external_id,
-                    }
-                )
-
-        return {
-            "heart_rate": heart_rate_samples,
-            "steps": step_samples,
-            "energy": energy_samples,
-        }
+        result: dict[str, list[dict[str, Any]]] = {}
+        for key, slots in merged.items():
+            summable = get_aggregation_method(EPOCHS_SERIES[key]) is AggregationMethod.SUM
+            result[key] = []
+            for sample, slot_values in slots.values():
+                if len(slot_values) == 1:
+                    sample["value"] = slot_values[0]
+                else:
+                    total = sum(Decimal(str(v)) for v in slot_values)
+                    sample["value"] = total if summable else total / len(slot_values)
+                result[key].append(sample)
+        return result
 
     def _build_epochs_samples(
         self,
@@ -959,13 +980,15 @@ class Garmin247Data(Base247DataTemplate):
         end_dt = self._from_epoch_seconds(start_ts + duration) if duration else start_dt
         zone_offset = offset_to_iso(raw_activity.get("startTimeOffsetInSeconds"))
 
-        activity_type = raw_activity.get("activityType", "unknown")
+        # Same unified mapping as the "activities" push (workouts.py), so a workout gets the same
+        # type whichever of the two Garmin feeds creates its record first.
+        activity_type = get_unified_workout_type(raw_activity.get("activityType") or "unknown").value
 
         record_id = uuid4()
         record = EventRecordCreate(
             id=record_id,
             category="workout",
-            type=activity_type.lower(),
+            type=activity_type,
             source_name="Garmin",
             device_model=raw_activity.get("deviceName"),
             duration_seconds=duration,
@@ -983,6 +1006,7 @@ class Garmin247Data(Base247DataTemplate):
         max_hr = raw_activity.get("maxHeartRateInBeatsPerMinute")
         elevation_gain = raw_activity.get("elevationGainInMeters")
         avg_speed = raw_activity.get("averageSpeedInMetersPerSecond")
+        steps = raw_activity.get("steps")
         avg_cadence = (
             raw_activity.get("averageRunCadenceInStepsPerMinute")
             or raw_activity.get("averageBikingCadenceInRevPerMinute")
@@ -995,6 +1019,7 @@ class Garmin247Data(Base247DataTemplate):
             energy_burned=Decimal(str(calories)) if calories is not None else None,
             heart_rate_avg=Decimal(str(avg_hr)) if avg_hr is not None else None,
             heart_rate_max=max_hr,
+            steps_count=int(steps) if steps is not None else None,
             total_elevation_gain=Decimal(str(elevation_gain)) if elevation_gain is not None else None,
             average_speed=Decimal(str(avg_speed)) if avg_speed is not None else None,
             average_cadence=Decimal(str(avg_cadence)) if avg_cadence is not None else None,
@@ -1383,6 +1408,22 @@ class Garmin247Data(Base247DataTemplate):
                     value=Decimal(str(diastolic)),
                     series_type=SeriesType.blood_pressure_diastolic,
                     external_id=summary_id,
+                )
+            )
+
+        # Pulse taken with the reading (a point heart rate measurement)
+        pulse = raw_bp.get("pulse")
+        if pulse:
+            samples.append(
+                TimeSeriesSampleCreate(
+                    id=uuid4(),
+                    user_id=user_id,
+                    source=self.provider_name,
+                    recorded_at=recorded_at,
+                    zone_offset=zone_offset,
+                    value=Decimal(str(pulse)),
+                    series_type=SeriesType.heart_rate,
+                    external_id=f"{summary_id}:pulse" if summary_id else None,
                 )
             )
 
@@ -1840,6 +1881,8 @@ class Garmin247Data(Base247DataTemplate):
         all_sleep_details: list[EventRecordDetailCreate] = []
         all_mct_details: list[MenstrualCycleDetailCreate] = []
         all_health_scores: list[HealthScoreCreate] = []
+        # Epochs are normalized together so the per-activity epochs of one slot can be merged.
+        epoch_items: list[dict[str, Any]] = []
 
         for item in items:
             try:
@@ -1850,8 +1893,7 @@ class Garmin247Data(Base247DataTemplate):
                         all_samples.extend(self._build_dailies_samples(user_id, normalized))
                         all_health_scores.extend(health_scores)
                     case "epochs":
-                        normalized = self.normalize_epochs([item], user_id)
-                        all_samples.extend(self._build_epochs_samples(user_id, normalized))
+                        epoch_items.append(item)
                     case "bodyComps":
                         all_samples.extend(self._build_body_comp_samples(user_id, item))
                     case "hrv":
@@ -2017,6 +2059,20 @@ class Garmin247Data(Base247DataTemplate):
                     self.logger,
                     "warning",
                     f"Error building batch item for {summary_type}: {e}",
+                    provider="garmin",
+                    task="process_items_batch",
+                    user_id=str(user_id),
+                )
+
+        if epoch_items:
+            try:
+                normalized_epochs = self.normalize_epochs(epoch_items, user_id)
+                all_samples.extend(self._build_epochs_samples(user_id, normalized_epochs))
+            except Exception as e:
+                log_structured(
+                    self.logger,
+                    "warning",
+                    f"Error building batch items for epochs: {e}",
                     provider="garmin",
                     task="process_items_batch",
                     user_id=str(user_id),

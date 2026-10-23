@@ -300,6 +300,12 @@ EXAMPLE_PAYLOADS: dict[str, dict] = {
     WebhookEventType.SERIES_ACTIVE_TIME: _ts_payload(
         WebhookEventType.SERIES_ACTIVE_TIME, "active_time", "garmin", "minutes", 312.0
     ),
+    WebhookEventType.SERIES_INTENSITY_MINUTES_MODERATE: _ts_payload(
+        WebhookEventType.SERIES_INTENSITY_MINUTES_MODERATE, "intensity_minutes_moderate", "garmin", "minutes", 24.0
+    ),
+    WebhookEventType.SERIES_INTENSITY_MINUTES_VIGOROUS: _ts_payload(
+        WebhookEventType.SERIES_INTENSITY_MINUTES_VIGOROUS, "intensity_minutes_vigorous", "garmin", "minutes", 12.0
+    ),
     # Activity basic
     WebhookEventType.SERIES_STAND_TIME: _ts_payload(
         WebhookEventType.SERIES_STAND_TIME, "stand_time", "apple", "min", 45.0

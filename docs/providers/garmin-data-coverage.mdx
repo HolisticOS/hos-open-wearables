@@ -1,0 +1,394 @@
+---
+title: "Garmin Data Coverage"
+sidebarTitle: "Data Coverage"
+description: "Field-by-field map of what Open Wearables stores from each Garmin push summary type, where it lands, and which REST endpoint reads it back."
+keywords: ["garmin data coverage", "garmin webhook fields", "garmin body battery", "garmin sleep stages", "garmin timeseries"]
+"og:title": "Garmin Data Coverage | Open Wearables"
+"og:description": "What Open Wearables stores from each Garmin push summary type and how to read it back."
+"og:url": "https://docs.openwearables.io/providers/garmin-data-coverage"
+"og:type": "article"
+"twitter:title": "Garmin Data Coverage | Open Wearables"
+"twitter:description": "What Open Wearables stores from each Garmin push summary type and how to read it back."
+"twitter:card": "summary_large_image"
+---
+
+This page traces every Garmin push summary type that the webhook handler accepts
+(`backend/app/services/providers/garmin/webhook_handler.py`) through to storage, field by field.
+It is derived from the code in `handlers/wellness.py`, `handlers/activities.py`, `data_247.py`,
+`workouts.py` and `coverage.py`. Field names are the ones the code reads; a field marked
+**dropped** arrives in the payload but is not stored anywhere.
+
+<Note>
+Garmin data arrives by push only. A summary type is stored only when the Garmin app is set up to push it
+and the user granted the matching permission. Nothing on this page triggers a pull from Garmin. The one
+exception is `activityFiles`, where the push carries a download link for the FIT file and the worker
+downloads it.
+</Note>
+
+## Where data lands
+
+| Storage | Table / model | Read back with |
+|---|---|---|
+| Time series sample | `data_point_series` (one row per data source, series type and timestamp) | `GET /users/{user_id}/timeseries` |
+| Sleep session | `event_record` (category `sleep`) + `sleep_details` | `GET /users/{user_id}/events/sleep` |
+| Workout | `event_record` (category `workout`) + `workout_details` | `GET /users/{user_id}/events/workouts` |
+| Menstrual cycle | `event_record` (category `menstrual_cycle`) + `menstrual_cycle_details` | `GET /users/{user_id}/events/menstrual-cycles` |
+| Health score | `health_score` (`sleep`, `stress`, `body_battery`) | `GET /users/{user_id}/health-scores` |
+
+Time series rows are keyed by `(data_source, series_type, recorded_at)`. A later push with the same key
+overwrites the value. Health scores are keyed by `(user, provider, category, recorded_at)` and the first
+one written wins (later pushes for the same key are ignored).
+
+**Device model.** Workouts carry the Garmin `deviceName` as `source.device`. Wellness summaries in the
+code paths below carry no device field, so their samples, sleep sessions and scores have
+`source.device = null` and `source.provider = "garmin"`. Workout samples are deliberately kept on the
+same device-less Garmin source as the wellness data, so daily summaries keep picking one Garmin source
+per day.
+
+## Coverage by summary type
+
+### dailies
+
+Recorded at the day's `startTimeInSeconds` with the day's offset. Summable values are flagged
+`is_daily_total = true`.
+
+| Field | Stored as |
+|---|---|
+| `steps` | series `steps` |
+| `distanceInMeters` | series `distance_walking_running` |
+| `activeKilocalories` | series `energy` |
+| `bmrKilocalories` | series `basal_energy` |
+| `floorsClimbed` | series `flights_climbed` |
+| `restingHeartRateInBeatsPerMinute` | series `resting_heart_rate` |
+| `activeTimeInSeconds` | series `active_time` (minutes) |
+| `moderateIntensityDurationInSeconds` | series `intensity_minutes_moderate` (minutes; not stored when absent) |
+| `vigorousIntensityDurationInSeconds` | series `intensity_minutes_vigorous` (minutes; not stored when absent) |
+| `timeOffsetHeartRateSamples` | series `heart_rate`, one sample per offset |
+| `averageStressLevel` (skipped when -1), `stressQualifier` | health score `stress` (`value`, `qualifier`) |
+| `maxStressLevel` | `stress` score component `max_stress_level` |
+| `rest/low/medium/high/activityStressDurationInSeconds` | `stress` score components `<level>_stress_duration_seconds` |
+| `min/max/averageHeartRateInBeatsPerMinute` | dropped (the heart rate samples cover them) |
+| `floorsDescended`, goals, hydration, `consumedCalories` | dropped |
+| `bodyBattery*` daily values (charged, drained, highest, lowest, most recent) | dropped; the timeline comes from `stressDetails` |
+| `averageSpo2`, `lowestSpo2`, respiration daily values | dropped; `pulseox` and `allDayRespiration` cover them |
+
+### epochs (15-minute slots)
+
+Garmin sends one epoch per activity type for each slot. Epochs of the same slot in one push are merged:
+summable values are added, heart rate and MET are averaged. Summable values are flagged
+`is_daily_total = false`, so daily summaries still prefer the `dailies` totals.
+
+| Field | Stored as |
+|---|---|
+| `steps` | series `steps` |
+| `activeKilocalories` | series `energy` |
+| `distanceInMeters` | series `distance_walking_running` |
+| `activeTimeInSeconds` | series `active_time` (minutes) |
+| `met` | series `average_met` |
+| `meanHeartRateInBeatsPerMinute` | series `heart_rate` |
+| `maxHeartRateInBeatsPerMinute`, `intensity`, `activityType` | dropped |
+
+### sleeps
+
+| Field | Stored as |
+|---|---|
+| `startTimeInSeconds`, `durationInSeconds`, `startTimeOffsetInSeconds` | sleep session start/end/offset (end extended to the last stage interval) |
+| `deep/light/remSleep/awake` durations | `sleep_details` stage minutes; total sleep and efficiency are derived |
+| `sleepLevelsMap` (`deep`, `light`, `rem`, `awake`) | `sleep_details.sleep_stages`, returned as `sleep_stage_intervals` |
+| `overallSleepScore.value`, `.qualifier` | health score `sleep` (recorded at sleep start) |
+| `sleepScores.<name>.qualifierKey` | `sleep` score components (qualifier only) |
+| `averageHeartRate`, `lowestHeartRate` | dropped (the sleep table has no heart rate columns) |
+| `respirationAvg`, `avgOxygenSaturation` | dropped; the sleep summary endpoint averages the respiration and SpO2 series over the sleep window |
+| stage keys other than the four above | dropped |
+| naps | every Garmin sleep is stored with `is_nap = false` |
+
+### stressDetails
+
+| Field | Stored as |
+|---|---|
+| `timeOffsetStressLevelValues` (negative values skipped) | series `garmin_stress_level`, one sample per offset |
+| `timeOffsetBodyBatteryValues` (negative values skipped) | series `garmin_body_battery`, one sample per offset |
+| peak of the body battery values | health score `body_battery` (recorded at summary start) |
+
+### allDayRespiration
+
+| Field | Stored as |
+|---|---|
+| `timeOffsetEpochToBreaths` (values above 0) | series `respiratory_rate`, one sample per offset |
+| `avgWakingRespirationValue` | series `respiratory_rate` at summary start, when present |
+
+### pulseox
+
+| Field | Stored as |
+|---|---|
+| `timeOffsetSpo2Values` (values above 0) | series `oxygen_saturation`, one sample per offset |
+| `avgSpo2` | series `oxygen_saturation` at summary start, when present |
+| `onDemandReadings`, `sleepSpo2` | not captured; payload shape unverified |
+
+### hrv
+
+| Field | Stored as |
+|---|---|
+| `lastNightAvg` | series `heart_rate_variability_rmssd` at summary start |
+| `hrvValues` (5-minute readings) | series `heart_rate_variability_rmssd`, one sample per offset |
+| `lastNight5MinHigh` | dropped |
+
+### healthSnapshot
+
+| `summaries[].summaryType` | Stored as (from `avgValue`, at snapshot start) |
+|---|---|
+| `heart_rate` | series `heart_rate` |
+| `rmssd_hrv` | series `heart_rate_variability_rmssd` |
+| `sdrr_hrv` | series `heart_rate_variability_sdnn` |
+| `stress` | series `garmin_stress_level` |
+| `pulse_ox` | series `oxygen_saturation` |
+| `respiration` | series `respiratory_rate` |
+
+### skinTemp
+
+| Field | Stored as |
+|---|---|
+| `skinTemperature` | series `skin_temperature` at summary start |
+
+<Warning>
+No sample `skinTemp` payload exists in the repository. If the delivered payload uses a different field
+name, nothing is stored. Check a raw stored payload before relying on this series.
+</Warning>
+
+### userMetrics
+
+Recorded at noon UTC of `calendarDate`.
+
+| Field | Stored as |
+|---|---|
+| `vo2Max` | series `vo2_max` |
+| `fitnessAge` | series `garmin_fitness_age` |
+
+### bloodPressures
+
+| Field | Stored as |
+|---|---|
+| `systolic` | series `blood_pressure_systolic` |
+| `diastolic` | series `blood_pressure_diastolic` |
+| `pulse` | series `heart_rate` (external id `<summaryId>:pulse`) |
+| `sourceType` | dropped |
+
+### bodyComps
+
+| Field | Stored as |
+|---|---|
+| `weightInGrams` | series `weight` (kg) |
+| `bodyFatInPercent` | series `body_fat_percentage` |
+| `bodyMassIndex` | series `body_mass_index` |
+| `muscleMassInGrams` | series `skeletal_muscle_mass` (kg) |
+| `boneMassInGrams`, `bodyWaterInPercent`, `visceralFatMass`, `metabolicAge`, `physiqueRating`, `basalMetabolicRateInKilocalories` | dropped (no series types for them) |
+
+### mct (menstrual cycle tracking)
+
+| Field | Stored as |
+|---|---|
+| `periodStartDate`, `cycleLength` / `predictedCycleLength` | record start/end |
+| `currentPhaseType` | record `type` |
+| `dayInCycle`, `currentPhase`, `currentPhaseType`, `lengthOfCurrentPhase`, `daysUntilNextPhase`, `predictedCycleLength`, `isPredictedCycle`, `cycleLength`, `lastUpdatedTimeInSeconds`, `hasSpecifiedCycleLength`, `hasSpecifiedPeriodLength`, `periodLength`, `fertileWindowStart`, `lengthOfFertileWindow`, `pregnancySnapshot` | `menstrual_cycle_details`, all returned by the menstrual cycle endpoint |
+
+### moveIQActivities
+
+Stored as an `event_record` with category `activity`, type `moveiq_<activityType>`, start and duration.
+No external endpoint returns category `activity` today, so these records are stored but not readable
+through the API.
+
+### activities (activity summary push)
+
+| Field | Stored as |
+|---|---|
+| `activityType` | workout `type`, mapped to the unified workout type (`app/constants/workout_types/garmin.py`) |
+| `deviceName` | `source.device` and `source_name` |
+| `startTimeInSeconds`, `durationInSeconds`, `startTimeOffsetInSeconds` | workout start/end/offset |
+| `activityId` | `external_id` |
+| `distanceInMeters`, `activeKilocalories`, `steps` | `distance`, `energy_burned`, `steps_count` |
+| `averageHeartRateInBeatsPerMinute`, `maxHeartRateInBeatsPerMinute` | `heart_rate_avg`, `heart_rate_max` |
+| `averageSpeedInMetersPerSecond`, `elevationGainInMeters` | `average_speed`, `total_elevation_gain` |
+| run / bike / swim average cadence | `average_cadence` |
+| `activityName`, `manual`, `isWebUpload` | dropped |
+
+### activityDetails
+
+The `summary` object builds the same workout record as `activities` (same unified type mapping, so
+whichever feed arrives first creates the record and the other is a duplicate).
+
+With `INGEST_WORKOUT_SAMPLES=true`, each entry in `samples[]` becomes time series rows at its
+`startTimeInSeconds`:
+
+| Sample field | Series |
+|---|---|
+| `heartRate` | `heart_rate` |
+| `speedMetersPerSecond` | `speed` |
+| `stepsPerMinute` | `cadence` |
+| `powerInWatts` | `power` |
+| `elevationInMeters` | `elevation` |
+| `latitudeInDegree` | `latitude` |
+| `longitudeInDegree` | `longitude` |
+| `airTemperatureCelcius` | `air_temperature` |
+
+Other sample fields and a `laps` list are not captured; their payload shape is not evidenced in the
+repository. Laps are covered by the FIT file below.
+
+### activityFiles
+
+FIT files only. The worker downloads the file from the pushed link and parses it:
+
+| FIT content | Stored as |
+|---|---|
+| laps / splits / lengths | `workout_details.segments` |
+| heart rate zones, power zones | `workout_details.hr_zones`, `workout_details.power_zones` |
+| record samples not already sent in `activityDetails` (for example air temperature) | time series rows, only with `INGEST_WORKOUT_SAMPLES=true` |
+
+Segments and zones are not returned by the workout list endpoint today.
+
+## Reading the data back
+
+Server-side consumers authenticate with the `X-Open-Wearables-API-Key` header. All paths are under
+`/api/v1`. Dates accept ISO 8601 (`2024-01-15T00:00:00Z`, `2024-01-15`) or Unix seconds.
+Paginated responses share one envelope (`app/schemas/utils/pagination.py`):
+
+```json
+{
+  "data": [],
+  "pagination": {"next_cursor": null, "previous_cursor": null, "has_more": false, "total_count": 0},
+  "metadata": {"resolution": null, "sample_count": 0, "start_time": null, "end_time": null}
+}
+```
+
+Pass `pagination.next_cursor` back as `cursor` to get the next page.
+
+### Time series (timelines, VO2 max, intensity minutes, workout samples and route)
+
+`GET /users/{user_id}/timeseries`
+
+| Param | Notes |
+|---|---|
+| `start_time`, `end_time` | required; a date-only `end_time` includes that whole day |
+| `types` | repeat for several (`types=garmin_body_battery&types=garmin_stress_level`); empty returns every type |
+| `cursor`, `limit` | `limit` 1-100, default 50 |
+| `resolution` | accepted but not applied; samples are always raw |
+
+Item shape (`TimeSeriesSample`, `app/schemas/responses/activity/data_point_responses.py`):
+
+```json
+{
+  "timestamp": "2024-01-15T00:03:00Z",
+  "zone_offset": "+01:00",
+  "type": "garmin_body_battery",
+  "value": 78,
+  "unit": "percent",
+  "source": {"provider": "garmin", "device": null},
+  "is_daily_total": null
+}
+```
+
+Garmin series by display need:
+
+| Display | `types` |
+|---|---|
+| Body Battery timeline | `garmin_body_battery` |
+| Stress timeline | `garmin_stress_level` |
+| Respiration timeline | `respiratory_rate` |
+| SpO2 | `oxygen_saturation` |
+| HRV (nightly average + 5-minute values) | `heart_rate_variability_rmssd`, `heart_rate_variability_sdnn` |
+| Heart rate | `heart_rate`, `resting_heart_rate` |
+| VO2 max, fitness age | `vo2_max`, `garmin_fitness_age` |
+| Intensity minutes (provider values) | `intensity_minutes_moderate`, `intensity_minutes_vigorous` |
+| Steps, calories, distance, floors, active time | `steps`, `energy`, `basal_energy`, `distance_walking_running`, `flights_climbed`, `active_time` |
+| Skin temperature | `skin_temperature` |
+| Blood pressure | `blood_pressure_systolic`, `blood_pressure_diastolic` |
+| Body composition | `weight`, `body_fat_percentage`, `body_mass_index`, `skeletal_muscle_mass` |
+| Workout samples / route | `heart_rate`, `speed`, `cadence`, `power`, `elevation`, `latitude`, `longitude`, `air_temperature` with `start_time`/`end_time` set to the workout's `start_time`/`end_time` |
+
+For daily-total series, filter on `is_daily_total = true` to get the Garmin daily value and skip
+intraday epoch rows. A route is the `latitude` and `longitude` rows paired by `timestamp`. Workout
+samples share the device-less Garmin source with wellness data, so heart rate in a workout window can
+include wellness heart rate samples from the same minutes.
+
+### Daily summaries
+
+| Endpoint | Params | Item schema |
+|---|---|---|
+| `GET /users/{user_id}/summaries/activity` | `start_date`, `end_date`, `cursor`, `limit` (1-400), `sort_order` (`asc`/`desc`), `timezone` (IANA) | `ActivitySummary` |
+| `GET /users/{user_id}/summaries/sleep` | `start_date`, `end_date`, `cursor`, `limit` (1-100) | `SleepSummary` |
+| `GET /users/{user_id}/summaries/recovery` | `start_date`, `end_date`, `cursor`, `limit` (1-100) | `RecoverySummary` |
+| `GET /users/{user_id}/summaries/body` | `average_period` (1-7), `latest_window_hours` (1-24) | `BodySummary` (not paginated; `null` when no data) |
+
+Schemas are in `app/schemas/responses/activity/summaries.py`. `ActivitySummary` holds `date`,
+`source`, `steps`, `distance_meters`, `floors_climbed`, `elevation_meters`, `active_calories_kcal`,
+`total_calories_kcal` (active plus basal), `active_minutes`, `sedentary_minutes`,
+`intensity_minutes` (`light`/`moderate`/`vigorous`, computed from heart rate zones, not the Garmin
+values) and `heart_rate` (`avg_bpm`/`max_bpm`/`min_bpm`). `SleepSummary` adds per-night stage minutes,
+naps, and heart rate, HRV, respiration and SpO2 averaged over the sleep window. `BodySummary` groups
+`slow_changing` (weight, body fat, muscle mass, BMI), `averaged` (resting HR, HRV) and `latest`
+(skin/body temperature, blood pressure).
+
+### Sleep sessions with stages
+
+`GET /users/{user_id}/events/sleep` with `start_date`, `end_date`, `cursor`, `limit` (1-100),
+`filter_by_priority` (default `false`).
+
+Item shape (`SleepSession`, `app/schemas/responses/activity/events.py`):
+
+```json
+{
+  "id": "uuid",
+  "start_time": "2024-01-14T22:00:00Z",
+  "end_time": "2024-01-15T00:40:00Z",
+  "zone_offset": null,
+  "source": {"provider": "garmin", "device": null},
+  "duration_seconds": 6000,
+  "sleep_duration_seconds": 5400,
+  "efficiency_percent": 90.0,
+  "stages": {"awake_minutes": 10, "light_minutes": 30, "deep_minutes": 30, "rem_minutes": 30},
+  "sleep_stage_intervals": [{"stage": "light", "start_time": "...", "end_time": "..."}],
+  "is_nap": false
+}
+```
+
+The Garmin sleep score is not on the session. Read it from health scores with `category=sleep`; its
+`recorded_at` equals the session `start_time`.
+
+### Workouts
+
+`GET /users/{user_id}/events/workouts` with `start_date`, `end_date`, `record_type` (case-insensitive
+substring of the unified type, for example `running`), `cursor`, `limit` (1-100). Newest first.
+
+Item shape (`Workout`): `id`, `type`, `name` (always `null`), `start_time`, `end_time`, `zone_offset`,
+`duration_seconds`, `source` (`provider`, `device` = Garmin device name), `calories_kcal`,
+`distance_meters`, `avg_heart_rate_bpm`, `max_heart_rate_bpm`, `avg_pace_sec_per_km` (always `null` in
+the list), `elevation_gain_meters`.
+
+<Warning>
+`GET /providers/{provider}/users/{user_id}/workouts` and `.../workouts/{workout_id}` call the provider's
+API directly. Do not use them to read stored Garmin data.
+</Warning>
+
+### Health scores
+
+`GET /users/{user_id}/health-scores` with `start_date`, `end_date`, `category` (`sleep`, `stress`,
+`body_battery`, ...), `provider` (`garmin`), `limit` (1-1000), `offset`.
+
+Item shape (`HealthScoreResponse`, `app/schemas/model_crud/activities/health_score.py`): `id`,
+`category`, `value`, `qualifier`, `recorded_at`, `zone_offset`, `components`
+(`{name: {"value": ..., "qualifier": ...}}`), `data_source_id`, `provider`.
+
+### Body composition
+
+Either the body summary (`/summaries/body`, latest values) or the time series endpoint with
+`types=weight&types=body_fat_percentage&types=body_mass_index&types=skeletal_muscle_mass` for history.
+
+### Menstrual cycle
+
+`GET /users/{user_id}/events/menstrual-cycles` with `start_date`, `end_date`, `cursor`, `limit` (1-100).
+Item shape (`MenstrualCycleRecord`): `id`, `start_time`, `end_time`, `zone_offset`, `source`, and every
+`mct` detail field listed above in snake case.
+
+### Devices
+
+`GET /users/{user_id}/data-sources` lists the user's data sources, including the Garmin device names seen
+on workouts.

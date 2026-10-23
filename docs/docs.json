@@ -50,7 +50,8 @@
               "providers/supported",
               "providers/coverage",
               "providers/garmin-api-integration",
-              "providers/garmin-data-pipeline"
+              "providers/garmin-data-pipeline",
+              "providers/garmin-data-coverage"
             ]
           },
           {

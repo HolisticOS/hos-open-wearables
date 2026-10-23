@@ -24,6 +24,9 @@ DAILIES_SERIES: list[tuple[str, SeriesType]] = [
     ("floors_climbed", SeriesType.flights_climbed),
     ("distance_meters", SeriesType.distance_walking_running),
     ("active_time", SeriesType.active_time),
+    ("bmr_calories", SeriesType.basal_energy),
+    ("moderate_intensity_minutes", SeriesType.intensity_minutes_moderate),
+    ("vigorous_intensity_minutes", SeriesType.intensity_minutes_vigorous),
 ]
 
 # Epoch sample category → SeriesType (/wellness-api/rest/epochs).
@@ -31,6 +34,9 @@ EPOCHS_SERIES: dict[str, SeriesType] = {
     "heart_rate": SeriesType.heart_rate,
     "steps": SeriesType.steps,
     "energy": SeriesType.energy,
+    "distance": SeriesType.distance_walking_running,
+    "active_time": SeriesType.active_time,
+    "met": SeriesType.average_met,
 }
 
 TIMESERIES: frozenset[SeriesType] = frozenset(
