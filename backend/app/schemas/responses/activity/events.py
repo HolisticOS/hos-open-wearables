@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.model_crud.activities import SleepStage
 from app.schemas.utils import SourceMetadata
@@ -93,3 +93,57 @@ class MenstrualCycleRecord(BaseModel):
     has_specified_cycle_length: bool | None = None
     has_specified_period_length: bool | None = None
     pregnancy_snapshot: list[dict] | None = None
+
+
+class WorkoutSampleSeries(BaseModel):
+    unit: str
+    points: list[tuple[datetime, float]] = Field(
+        default_factory=list, description="[timestamp, value] pairs, one per time bucket (bucket average)"
+    )
+
+
+class WorkoutLap(BaseModel):
+    """One lap from the workout's FIT file. Extra lap metrics from the file are passed through as-is."""
+
+    model_config = ConfigDict(extra="allow")
+
+    index: int
+    start_time: datetime | None = None
+    end_time: datetime | None = None
+    duration_seconds: float | None = None
+    distance_meters: float | None = None
+    avg_heart_rate_bpm: float | None = None
+    max_heart_rate_bpm: float | None = None
+    avg_speed_mps: float | None = None
+    max_speed_mps: float | None = None
+
+
+class HeartRateZoneRead(BaseModel):
+    zone: int
+    min_bpm: int | None = None
+    max_bpm: int | None = None
+    seconds: float
+
+
+class PowerZoneRead(BaseModel):
+    zone: int
+    min_watts: int | None = None
+    max_watts: int | None = None
+    seconds: float
+
+
+class WorkoutSamples(BaseModel):
+    """Downsampled per-workout samples, route, laps and zones."""
+
+    workout_id: UUID
+    start_time: datetime
+    end_time: datetime
+    source: SourceMetadata
+    series: dict[str, WorkoutSampleSeries] = Field(default_factory=dict)
+    route: list[tuple[datetime, float, float]] = Field(
+        default_factory=list, description="[timestamp, latitude, longitude]; real recorded points, never averaged"
+    )
+    laps: list[WorkoutLap] = Field(default_factory=list)
+    zones: dict[str, list[HeartRateZoneRead] | list[PowerZoneRead]] = Field(
+        default_factory=dict, description="Time in zone from the FIT file; keys present only when stored"
+    )

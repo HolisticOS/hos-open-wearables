@@ -27,8 +27,8 @@ class HealthScoreService(
         return self.crud.get_by_any_component(db_session, components)
 
     @handle_exceptions
-    def bulk_create(self, db_session: DbSession, scores: list[HealthScoreCreate]) -> None:
-        self.crud.bulk_create(db_session, scores)
+    def bulk_create(self, db_session: DbSession, scores: list[HealthScoreCreate], upsert: bool = False) -> None:
+        self.crud.bulk_create(db_session, scores, upsert=upsert)
 
     @handle_exceptions
     def get_latest_by_category(

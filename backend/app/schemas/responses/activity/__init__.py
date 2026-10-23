@@ -5,12 +5,17 @@ from .data_point_responses import (
     TimeSeriesSample,
 )
 from .events import (
+    HeartRateZoneRead,
     Meal,
     Measurement,
     MenstrualCycleRecord,
+    PowerZoneRead,
     SleepSession,
     Workout,
     WorkoutDetailed,
+    WorkoutLap,
+    WorkoutSamples,
+    WorkoutSampleSeries,
 )
 from .resilience import (
     DailyHrvScore,
@@ -42,6 +47,11 @@ __all__ = [
     # Events
     "Workout",
     "WorkoutDetailed",
+    "WorkoutSamples",
+    "WorkoutSampleSeries",
+    "WorkoutLap",
+    "HeartRateZoneRead",
+    "PowerZoneRead",
     "Meal",
     "Measurement",
     "MenstrualCycleRecord",

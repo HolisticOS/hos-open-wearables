@@ -4,15 +4,18 @@ from uuid import UUID
 from fastapi import APIRouter, HTTPException, Query, status
 
 from app.database import DbSession
+from app.schemas.enums import SeriesType
 from app.schemas.model_crud.activities import EventRecordQueryParams
 from app.schemas.responses.activity import (
     MenstrualCycleRecord,
     SleepSession,
     Workout,
+    WorkoutSamples,
 )
 from app.schemas.utils import PaginatedResponse
 from app.services import ApiKeyDep
 from app.services.event_record_service import event_record_service
+from app.services.workout_samples_service import WORKOUT_SAMPLE_TYPES, workout_samples_service
 from app.utils.dates import DateTimeQueryParam, parse_query_datetime
 
 router = APIRouter()
@@ -38,6 +41,35 @@ def list_workouts(
         record_type=record_type,
     )
     return event_record_service.get_workouts(db, user_id, params)
+
+
+@router.get("/users/{user_id}/events/workouts/{workout_id}/samples")
+def get_workout_samples(
+    user_id: UUID,
+    workout_id: UUID,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+    types: Annotated[
+        list[SeriesType],
+        Query(
+            description="Series to return (repeatable). Default: all of "
+            + ", ".join(t.value for t in WORKOUT_SAMPLE_TYPES)
+            + ". latitude and longitude together form the route."
+        ),
+    ] = [],
+    max_points: Annotated[int, Query(ge=1, le=2000, description="Maximum points per series and for the route")] = 600,
+) -> WorkoutSamples:
+    """Returns one workout's samples downsampled by time, its route, laps and time in zones."""
+    unsupported = [t.value for t in types if t not in WORKOUT_SAMPLE_TYPES]
+    if unsupported:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported workout sample types: {', '.join(unsupported)}",
+        )
+    result = workout_samples_service.get_workout_samples(db, user_id, workout_id, types, max_points)
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workout not found")
+    return result
 
 
 @router.get("/users/{user_id}/events/sleep")

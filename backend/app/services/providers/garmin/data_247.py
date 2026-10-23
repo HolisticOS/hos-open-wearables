@@ -568,7 +568,7 @@ class Garmin247Data(Base247DataTemplate):
         if samples:
             counts = self.data_point_repo.bulk_create(db, samples)
         if health_scores:
-            health_score_service.bulk_create(db, health_scores)
+            health_score_service.bulk_create(db, health_scores, upsert=True)
             db.commit()
         return counts
 
@@ -1192,7 +1192,7 @@ class Garmin247Data(Base247DataTemplate):
         if samples:
             counts = self.data_point_repo.bulk_create(db, samples)
         if score := self._normalize_body_battery_health_score(user_id, raw_stress):
-            health_score_service.bulk_create(db, [score])
+            health_score_service.bulk_create(db, [score], upsert=True)
             db.commit()
         return counts
 
@@ -2109,7 +2109,7 @@ class Garmin247Data(Base247DataTemplate):
             count += len(inserted_ids)
 
         if all_health_scores:
-            health_score_service.bulk_create(db, all_health_scores)
+            health_score_service.bulk_create(db, all_health_scores, upsert=True)
             db.commit()
 
         return count

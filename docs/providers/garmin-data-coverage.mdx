@@ -36,8 +36,14 @@ downloads it.
 | Health score | `health_score` (`sleep`, `stress`, `body_battery`) | `GET /users/{user_id}/health-scores` |
 
 Time series rows are keyed by `(data_source, series_type, recorded_at)`. A later push with the same key
-overwrites the value. Health scores are keyed by `(user, provider, category, recorded_at)` and the first
-one written wins (later pushes for the same key are ignored).
+overwrites the value. Health scores are keyed by `(user, provider, category, recorded_at)`; for Garmin a
+later push with the same key replaces the value, qualifier, components and zone offset (Garmin re-sends
+revised summaries for the same day).
+
+<Warning>
+Time series values are stored as `NUMERIC(10,3)`, so latitude and longitude keep three decimals
+(roughly 110 m north-south). Routes drawn from these points are coarse.
+</Warning>
 
 **Device model.** Workouts carry the Garmin `deviceName` as `source.device`. Wellness summaries in the
 code paths below carry no device field, so their samples, sleep sessions and scores have
@@ -243,7 +249,8 @@ FIT files only. The worker downloads the file from the pushed link and parses it
 | heart rate zones, power zones | `workout_details.hr_zones`, `workout_details.power_zones` |
 | record samples not already sent in `activityDetails` (for example air temperature) | time series rows, only with `INGEST_WORKOUT_SAMPLES=true` |
 
-Segments and zones are not returned by the workout list endpoint today.
+Segments (laps) and zones are returned by the workout samples endpoint below. They are parsed from every
+pushed FIT file; `STORE_FIT_FILES` only controls whether the raw file is also archived to object storage.
 
 ## Reading the data back
 
@@ -360,8 +367,53 @@ substring of the unified type, for example `running`), `cursor`, `limit` (1-100)
 
 Item shape (`Workout`): `id`, `type`, `name` (always `null`), `start_time`, `end_time`, `zone_offset`,
 `duration_seconds`, `source` (`provider`, `device` = Garmin device name), `calories_kcal`,
-`distance_meters`, `avg_heart_rate_bpm`, `max_heart_rate_bpm`, `avg_pace_sec_per_km` (always `null` in
-the list), `elevation_gain_meters`.
+`distance_meters`, `avg_heart_rate_bpm`, `max_heart_rate_bpm`, `avg_pace_sec_per_km` (for pace-based
+types: from average speed, else duration over distance; `null` otherwise), `elevation_gain_meters`.
+
+### Workout samples, route, laps and zones
+
+`GET /users/{user_id}/events/workouts/{workout_id}/samples`
+
+| Param | Notes |
+|---|---|
+| `types` | repeatable; any of `heart_rate`, `speed`, `cadence`, `power`, `elevation`, `air_temperature`, `latitude`, `longitude`; default all. Other types return 400. |
+| `max_points` | 1-2000, default 600; upper bound per series and for the route |
+
+Samples come from the workout's own data source when it has any in the workout window, otherwise from
+the user's other sources of the same provider (Garmin keeps workout samples on its device-less source).
+Other providers' samples never mix in. The window is split into `max_points` equal time buckets: each
+numeric series returns one point per non-empty bucket, the bucket's average value at the average
+timestamp of its samples. The route keeps real recorded points, the one nearest each bucket centre,
+and needs both `latitude` and `longitude` requested. Returns 404 when the workout is not the user's.
+
+```json
+{
+  "workout_id": "uuid",
+  "start_time": "2025-11-20T07:00:00Z",
+  "end_time": "2025-11-20T08:00:00Z",
+  "source": {"provider": "garmin", "device": "Forerunner 965"},
+  "series": {
+    "heart_rate": {"unit": "bpm", "points": [["2025-11-20T07:00:02.5Z", 122.5]]},
+    "speed": {"unit": "m_per_s", "points": []}
+  },
+  "route": [["2025-11-20T07:00:03Z", 52.003, 21.003]],
+  "laps": [
+    {"index": 0, "start_time": "...", "end_time": "...", "duration_seconds": 1800.0,
+     "distance_meters": 5000.0, "avg_heart_rate_bpm": 138.0, "max_heart_rate_bpm": 159.0,
+     "avg_speed_mps": 2.78, "max_speed_mps": null, "avg_cadence": 84.0, "total_ascent": 12.0}
+  ],
+  "zones": {
+    "heart_rate": [{"zone": 0, "min_bpm": null, "max_bpm": 110, "seconds": 120.0}],
+    "power": [{"zone": 0, "min_watts": null, "max_watts": 150, "seconds": 60.0}]
+  }
+}
+```
+
+Series without data are left out of `series`. `laps`, `route` and `zones` are empty (`[]` / `{}`) when
+nothing is stored. Laps other than the named fields pass through the FIT lap metrics as stored
+(`avg_power`, `max_power`, `normalized_power`, `avg_cadence`, `total_strides`, `total_ascent`,
+`total_descent`, running dynamics). Schema: `WorkoutSamples` in
+`app/schemas/responses/activity/events.py`.
 
 <Warning>
 `GET /providers/{provider}/users/{user_id}/workouts` and `.../workouts/{workout_id}` call the provider's

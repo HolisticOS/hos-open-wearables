@@ -55,14 +55,34 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         results = query.order_by(desc(HealthScore.recorded_at)).offset(params.offset).limit(params.limit).all()
         return results, total_count
 
-    def bulk_create(self, db_session: DbSession, creators: list[HealthScoreCreate]) -> None:
-        """Bulk insert health scores, doing nothing on conflict with the unique constraint."""
+    def bulk_create(self, db_session: DbSession, creators: list[HealthScoreCreate], upsert: bool = False) -> None:
+        """Bulk insert health scores.
+
+        On a clash with ``(user_id, provider, category, recorded_at)`` the existing row is kept, or,
+        with ``upsert=True``, its value, qualifier, components and zone offset are replaced by the
+        new ones (for providers that re-send a revised score for the same time).
+        """
         if not creators:
             return
 
         values = [c.model_dump() for c in creators]
 
-        stmt = insert(HealthScore).values(values).on_conflict_do_nothing()
+        if not upsert:
+            db_session.execute(insert(HealthScore).values(values).on_conflict_do_nothing())
+            return
+
+        # One INSERT cannot update the same row twice: keep the last score per conflict key.
+        deduped = {(v["user_id"], v["provider"], v["category"], v["recorded_at"]): v for v in values}
+        stmt = insert(HealthScore).values(list(deduped.values()))
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_health_score_user_provider_category_time",
+            set_={
+                "value": stmt.excluded.value,
+                "qualifier": stmt.excluded.qualifier,
+                "components": stmt.excluded.components,
+                "zone_offset": stmt.excluded.zone_offset,
+            },
+        )
         db_session.execute(stmt)
         # Caller is responsible for commit — allows batching with other operations
 

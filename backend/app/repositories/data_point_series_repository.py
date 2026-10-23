@@ -1,11 +1,28 @@
 import contextlib
-from datetime import datetime, time, timedelta
+from dataclasses import dataclass
+from datetime import datetime, time, timedelta, timezone
+from typing import Any
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
-from sqlalchemy import ColumnElement, Date, Interval, String, and_, asc, case, cast, func, literal_column, text, tuple_
+from sqlalchemy import (
+    ColumnElement,
+    Date,
+    Interval,
+    String,
+    and_,
+    asc,
+    case,
+    cast,
+    extract,
+    func,
+    literal_column,
+    text,
+    tuple_,
+)
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError as SQLAIntegrityError
+from sqlalchemy.orm import Query
 
 from app.database import DbSession
 from app.models import DataPointSeries, DataSource, DeviceTypePriority, ProviderPriority
@@ -33,6 +50,18 @@ from app.utils.pagination import decode_cursor
 
 # Identity tuple: (user_id, device_model, source)
 DataSourceIdentity = tuple[UUID, str | None, str | None]
+
+
+@dataclass(frozen=True)
+class WorkoutWindow:
+    """Time window and data source scope of one workout's samples."""
+
+    user_id: UUID
+    start: datetime
+    end: datetime
+    provider: ProviderName
+    source: str | None
+    data_source_id: UUID | None = None
 
 
 def local_date_expr(
@@ -523,6 +552,94 @@ class DataPointSeriesRepository(
 
         rows = db_session.execute(sql, params).fetchall()
         return {UUID(str(record_id)): int(avg) for record_id, avg in rows}
+
+    def _workout_window_query(
+        self,
+        db_session: DbSession,
+        columns: list[Any],
+        window: WorkoutWindow,
+        type_ids: list[int],
+    ) -> Query:
+        """Samples of the given types inside a workout window, scoped to the workout's own source.
+
+        ``window.data_source_id`` set: only that data source. Otherwise every data source of the
+        user that shares the workout's provider (and source name, when it has one), so samples
+        from other providers recorded at the same time never mix in.
+        """
+        query = db_session.query(*columns).filter(
+            self.model.series_type_definition_id.in_(type_ids),
+            self.model.recorded_at >= window.start,
+            self.model.recorded_at <= window.end,
+        )
+        if window.data_source_id is not None:
+            return query.filter(self.model.data_source_id == window.data_source_id)
+        query = query.join(DataSource, self.model.data_source_id == DataSource.id).filter(
+            DataSource.user_id == window.user_id,
+            DataSource.provider == window.provider,
+        )
+        if window.source is not None:
+            query = query.filter(DataSource.source == window.source)
+        return query
+
+    def has_samples_in_window(self, db_session: DbSession, window: WorkoutWindow, type_ids: list[int]) -> bool:
+        """True when at least one sample of the given types exists for the window's scope."""
+        return self._workout_window_query(db_session, [self.model.id], window, type_ids).limit(1).first() is not None
+
+    def get_bucketed_averages(
+        self,
+        db_session: DbSession,
+        window: WorkoutWindow,
+        type_ids: list[int],
+        buckets: int,
+    ) -> list[tuple[int, datetime, float]]:
+        """Average each series over ``buckets`` equal time slices of the window, in one query.
+
+        Returns (series_type_id, mean timestamp of the bucket's samples, mean value), ordered by
+        type and time. Each type yields at most ``buckets`` rows.
+        """
+        span = max((window.end - window.start).total_seconds(), 1.0)
+        epoch = extract("epoch", self.model.recorded_at)
+        offset = epoch - window.start.timestamp()
+        bucket = func.least(func.floor(offset * buckets / span), buckets - 1).label("bucket")
+        rows = (
+            self._workout_window_query(
+                db_session,
+                [
+                    self.model.series_type_definition_id,
+                    bucket,
+                    func.avg(epoch).label("ts"),
+                    func.avg(self.model.value).label("value"),
+                ],
+                window,
+                type_ids,
+            )
+            .group_by(self.model.series_type_definition_id, bucket)
+            .order_by(self.model.series_type_definition_id, bucket)
+            .all()
+        )
+        return [
+            (row.series_type_definition_id, datetime.fromtimestamp(float(row.ts), tz=timezone.utc), float(row.value))
+            for row in rows
+        ]
+
+    def get_raw_points(
+        self,
+        db_session: DbSession,
+        window: WorkoutWindow,
+        type_ids: list[int],
+    ) -> list[tuple[int, datetime, float]]:
+        """Every sample of the given types in the window as (series_type_id, recorded_at, value), by time."""
+        rows = (
+            self._workout_window_query(
+                db_session,
+                [self.model.series_type_definition_id, self.model.recorded_at, self.model.value],
+                window,
+                type_ids,
+            )
+            .order_by(self.model.recorded_at)
+            .all()
+        )
+        return [(type_id, recorded_at, float(value)) for type_id, recorded_at, value in rows]
 
     def get_averages_for_time_range(
         self,

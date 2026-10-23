@@ -230,3 +230,30 @@ class TestHealthScoreRepositoryBulkCreate:
         results = db.query(HealthScore).filter(HealthScore.data_source_id == data_source.id).all()
         assert len(results) == 1
         assert results[0].value == Decimal("80.00")
+
+    def test_bulk_create_upsert_replaces_revised_score(self, db: Session, repo: HealthScoreRepository) -> None:
+        data_source = DataSourceFactory()
+        recorded_at = datetime.now(timezone.utc)
+
+        def score(value: str, qualifier: str) -> HealthScoreCreate:
+            return HealthScoreCreate(
+                id=uuid4(),
+                user_id=data_source.user_id,
+                data_source_id=data_source.id,
+                provider=ProviderName.GARMIN,
+                category=HealthScoreCategory.STRESS,
+                value=Decimal(value),
+                qualifier=qualifier,
+                recorded_at=recorded_at,
+            )
+
+        repo.bulk_create(db, [score("30.00", "Calm")], upsert=True)
+        db.commit()
+        # A revised push, sent twice in one batch: the last one wins.
+        repo.bulk_create(db, [score("41.00", "Balanced"), score("42.00", "Stressful")], upsert=True)
+        db.commit()
+
+        results = db.query(HealthScore).filter(HealthScore.data_source_id == data_source.id).all()
+        assert len(results) == 1
+        assert results[0].value == Decimal("42.00")
+        assert results[0].qualifier == "Stressful"

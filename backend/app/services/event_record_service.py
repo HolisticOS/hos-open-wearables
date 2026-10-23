@@ -664,6 +664,17 @@ class EventRecordService(
         """Get count of workouts grouped by workout type."""
         return self.crud.get_count_by_workout_type(db_session)
 
+    @staticmethod
+    def _avg_pace_sec_per_km(record: EventRecord, details: WorkoutDetails | None) -> float | None:
+        """Seconds per km for pace-based workout types: from average speed, else distance and duration."""
+        if details is None or record.type not in WORKOUTS_WITH_PACE:
+            return None
+        if details.average_speed and details.average_speed > 0:
+            return round(1000 / float(details.average_speed), 1)
+        if details.distance and details.distance > 0 and record.duration_seconds:
+            return round(record.duration_seconds / float(details.distance) * 1000, 1)
+        return None
+
     def _map_source(self, data_source: DataSource) -> DataSourceSchema:
         return DataSourceSchema(
             provider=data_source.source or "unknown",
@@ -735,7 +746,7 @@ class EventRecordService(
                 distance_meters=float(details.distance) if details and details.distance else None,
                 avg_heart_rate_bpm=computed_hr.get(record.id),
                 max_heart_rate_bpm=details.heart_rate_max if details else None,
-                avg_pace_sec_per_km=None,  # Derived or in details?
+                avg_pace_sec_per_km=self._avg_pace_sec_per_km(record, details),
                 elevation_gain_meters=float(details.total_elevation_gain)
                 if details and details.total_elevation_gain
                 else None,
@@ -777,14 +788,7 @@ class EventRecordService(
 
         details: WorkoutDetails | None = record.detail if isinstance(record.detail, WorkoutDetails) else None
 
-        if details and record.type in WORKOUTS_WITH_PACE:
-            # Seconds per kilometer - speed is in meters per second
-            if details.average_speed and details.average_speed > 0:
-                avg_pace_sec_per_km = 1000 / details.average_speed
-            elif details.distance > 0:  # ty:ignore[unsupported-operator]
-                avg_pace_sec_per_km = record.duration_seconds / details.distance * 1000  # ty:ignore[unsupported-operator]
-        else:
-            avg_pace_sec_per_km = None
+        avg_pace_sec_per_km = self._avg_pace_sec_per_km(record, details)
 
         return WorkoutDetailed(
             id=record.id,
@@ -799,7 +803,7 @@ class EventRecordService(
             distance_meters=float(details.distance) if details and details.distance else None,
             avg_heart_rate_bpm=self._resolve_avg_hr(db_session, [record]).get(record.id),
             max_heart_rate_bpm=details.heart_rate_max if details else None,
-            avg_pace_sec_per_km=avg_pace_sec_per_km,  # ty:ignore[invalid-argument-type]
+            avg_pace_sec_per_km=avg_pace_sec_per_km,
             elevation_gain_meters=float(details.total_elevation_gain)
             if details and details.total_elevation_gain
             else None,
