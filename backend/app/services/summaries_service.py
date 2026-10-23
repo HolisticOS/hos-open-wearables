@@ -66,6 +66,19 @@ DEFAULT_MAX_HR = 190  # Assumes ~30 years old when birth_date unavailable
 ACTIVE_STEPS_THRESHOLD = 30  # Steps per minute to be considered "active"
 METERS_PER_FLOOR = 3.0  # Standard floor height for floors_climbed calculation
 
+# Activity metrics a lower-priority source may fill when the day's preferred source has
+# nothing for them (a Garmin day without heart rate takes the Apple Watch's). Each group
+# is taken whole from one source so related values (HR avg/min/max) aren't mixed.
+ACTIVITY_FALLBACK_GROUPS: tuple[tuple[str, ...], ...] = (
+    ("steps_sum",),
+    ("active_energy_sum",),
+    ("basal_energy_sum",),
+    ("hr_avg", "hr_max", "hr_min"),
+    ("distance_sum",),
+    ("flights_climbed_sum",),
+    ("active_time_sum",),
+)
+
 # HR zone percentages (as fraction of max HR)
 HR_ZONE_LIGHT = (0.50, 0.63)  # 50-63% of max HR
 HR_ZONE_MODERATE = (0.64, 0.76)  # 64-76% of max HR
@@ -111,12 +124,15 @@ class SummariesService:
         user_id: UUID,
         results: list[dict] | list,
         date_key: str = "activity_date",
+        fallback_groups: tuple[tuple[str, ...], ...] = (),
     ) -> list[dict] | list:
         """Filter results to highest priority source per date.
 
         Args:
             results: List of dicts with date, source (provider), device_model
             date_key: Key name for date field (activity_date or sleep_date)
+            fallback_groups: Metric keys the winning entry may take from the next
+                source down when it has no value for them (None or 0)
 
         Returns:
             Filtered list with only highest priority entry per date
@@ -162,9 +178,55 @@ class SummariesService:
                 return (provider_priority, device_type_priority, device_model or "")
 
             entries_sorted = sorted(entries, key=sort_key)
-            filtered.append(entries_sorted[0])
+            filtered.append(self._fill_from_fallbacks(entries_sorted, fallback_groups))
 
         return filtered
+
+    @staticmethod
+    def _prefer_provider(
+        by_provider: dict[str, dict[SeriesType, float]],
+        preferred: str | None,
+        provider_order: dict[ProviderName, int],
+    ) -> dict[SeriesType, float]:
+        """Per series type, the preferred provider's value, else the best-ranked provider's."""
+
+        def rank(provider: str) -> tuple[int, int, str]:
+            try:
+                priority = provider_order.get(ProviderName(provider), 99)
+            except ValueError:
+                priority = 99
+            return (0 if provider == preferred else 1, priority, provider)
+
+        merged: dict[SeriesType, float] = {}
+        for provider in sorted(by_provider, key=rank):
+            for series_type, value in by_provider[provider].items():
+                merged.setdefault(series_type, value)
+        return merged
+
+    @staticmethod
+    def _fill_from_fallbacks(entries_sorted: list[dict], fallback_groups: tuple[tuple[str, ...], ...]) -> dict:
+        """The first entry, with each empty metric group taken from the next entry that has it.
+
+        The winner keeps its identity (source, device, record id); only metric values move.
+        """
+        winner = entries_sorted[0]
+        if not fallback_groups or len(entries_sorted) == 1:
+            return winner
+
+        def empty(entry: dict, group: tuple[str, ...]) -> bool:
+            return all(not entry.get(key) for key in group)
+
+        merged = None
+        for group in fallback_groups:
+            if not empty(winner, group):
+                continue
+            donor = next((e for e in entries_sorted[1:] if not empty(e, group)), None)
+            if donor is None:
+                continue
+            merged = merged if merged is not None else dict(winner)
+            for key in group:
+                merged[key] = donor.get(key)
+        return merged if merged is not None else winner
 
     def _get_user_max_hr(self, db_session: DbSession, user_id: UUID, reference_date: datetime) -> int:
         """Calculate user's max HR based on age.
@@ -271,6 +333,7 @@ class SummariesService:
 
         # Filter by priority to get best source per date
         results = self._filter_by_priority(db_session, user_id, results, date_key="sleep_date")
+        provider_order = ProviderPriorityRepository(ProviderPriority).get_priority_order(db_session)
 
         # Check if there's more data
         has_more = len(results) > limit
@@ -324,13 +387,17 @@ class SummariesService:
             sleep_end = result.get("max_end_time")
             if sleep_start and sleep_end:
                 try:
-                    physio_averages = self.data_point_repo.get_averages_for_time_range(
+                    # Vitals from the night's own source; another provider only fills a
+                    # type it has nothing for (e.g. SpO2 from the Apple Watch under a
+                    # Garmin night), instead of averaging every provider together.
+                    by_provider = self.data_point_repo.get_averages_by_provider_for_time_range(
                         db_session,
                         user_id,
                         sleep_start,
                         sleep_end,
                         SLEEP_PHYSIO_SERIES_TYPES,
                     )
+                    physio_averages = self._prefer_provider(by_provider, result.get("provider"), provider_order)
                     hr_avg = physio_averages.get(SeriesType.heart_rate)
                     avg_hr = int(round(hr_avg)) if hr_avg is not None else None
                     avg_hrv_sdnn = physio_averages.get(SeriesType.heart_rate_variability_sdnn)
@@ -482,7 +549,9 @@ class SummariesService:
         results = self._merge_archive_activity(db_session, user_id, start_date, end_date, results)
 
         # Filter by priority to get best source per date
-        results = self._filter_by_priority(db_session, user_id, results, date_key="activity_date")
+        results = self._filter_by_priority(
+            db_session, user_id, results, date_key="activity_date", fallback_groups=ACTIVITY_FALLBACK_GROUPS
+        )
 
         # Get workout aggregates (elevation, distance, energy from workouts)
         workout_aggregates = self.event_record_repo.get_daily_workout_aggregates(
@@ -497,8 +566,12 @@ class SummariesService:
 
         # Get active/sedentary minutes from step data
         activity_minutes = self.data_point_repo.get_daily_active_minutes(
-            db_session, user_id, start_date, end_date, active_threshold=ACTIVE_STEPS_THRESHOLD,
-            timezone_name=timezone_name
+            db_session,
+            user_id,
+            start_date,
+            end_date,
+            active_threshold=ACTIVE_STEPS_THRESHOLD,
+            timezone_name=timezone_name,
         )
 
         # Build lookup for activity minutes

@@ -27,7 +27,7 @@ class TestProviderPriorityRepository:
         # Assert
         assert priority is not None
         assert priority.provider == provider
-        assert priority.priority == 1  # Default priority
+        assert priority.priority == 20  # Default: Apple Health ranks below the wearables
 
         # Verify in database
         db_priority = db.query(ProviderPriority).filter_by(provider=provider).first()
@@ -87,6 +87,24 @@ class TestProviderPriorityRepository:
         # Verify ordering by priority (ascending)
         priorities_values = [p.priority for p in all_priorities]
         assert priorities_values == sorted(priorities_values)
+
+    def test_priority_order_defaults_put_wearables_ahead_of_apple(
+        self, db: Session, repo: ProviderPriorityRepository
+    ) -> None:
+        """With no stored rows, a connected wearable still beats Apple Health."""
+        order = repo.get_priority_order(db)
+
+        assert order[ProviderName.GARMIN] < order[ProviderName.APPLE]
+        assert order[ProviderName.WHOOP] < order[ProviderName.APPLE]
+
+    def test_priority_order_stored_row_overrides_default(self, db: Session, repo: ProviderPriorityRepository) -> None:
+        """A priority someone set wins over the default; others keep their defaults."""
+        repo.upsert(db, ProviderName.APPLE, 0)
+
+        order = repo.get_priority_order(db)
+
+        assert order[ProviderName.APPLE] == 0
+        assert order[ProviderName.GARMIN] == 1
 
     def test_get_all_empty_database(self, db: Session, repo: ProviderPriorityRepository) -> None:
         """Should return empty list when no priorities exist."""

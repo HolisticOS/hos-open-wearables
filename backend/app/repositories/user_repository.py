@@ -56,6 +56,9 @@ class UserRepository(CrudRepository[User, UserCreateInternal, UserUpdateInternal
             query = query.filter(
                 or_(
                     cast(self.model.id, String).ilike(search_term, escape="\\"),
+                    # Users created through an integration often carry only the
+                    # caller's id (no email or name), so it has to be searchable too.
+                    self.model.external_user_id.ilike(search_term, escape="\\"),
                     self.model.email.ilike(search_term, escape="\\"),
                     self.model.first_name.ilike(search_term, escape="\\"),
                     self.model.last_name.ilike(search_term, escape="\\"),

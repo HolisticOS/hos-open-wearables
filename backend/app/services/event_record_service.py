@@ -587,7 +587,9 @@ class EventRecordService(
         detail_type: str = "workout",
     ) -> None:
         """Bulk create event record details and fire one webhook per detail on commit."""
-        self.event_record_detail_repo.bulk_create(db_session, details, detail_type=detail_type)  # ty:ignore[invalid-argument-type]
+        self.event_record_detail_repo.bulk_create(
+            db_session, details, detail_type=detail_type
+        )  # ty:ignore[invalid-argument-type]
 
         if not details or not svix_service.is_enabled():
             return
@@ -681,12 +683,56 @@ class EventRecordService(
             device=data_source.device_model,
         )
 
+    # Two workouts from different providers are the same session when their overlap covers
+    # at least this share of the shorter one (Garmin cloud vs. Garmin Connect's copy in
+    # Apple Health start and end within seconds; back-to-back sessions barely overlap).
+    DUPLICATE_WORKOUT_OVERLAP = 0.5
+
+    @classmethod
+    def _drop_duplicate_workouts(
+        cls,
+        records: list[tuple[EventRecord, DataSource]],
+        provider_order: dict[ProviderName, int],
+    ) -> list[tuple[EventRecord, DataSource]]:
+        """Keep one workout per session across providers: the best-ranked provider's.
+
+        Workouts from the same provider are never dropped, only a lower-ranked
+        provider's copy of a session a better-ranked one also recorded.
+        """
+
+        def rank(provider: object) -> int:
+            try:
+                return provider_order.get(ProviderName(provider), 99)
+            except ValueError:
+                return 99
+
+        def same_session(a: EventRecord, b: EventRecord) -> bool:
+            overlap = (min(a.end_datetime, b.end_datetime) - max(a.start_datetime, b.start_datetime)).total_seconds()
+            shorter = min(
+                (a.end_datetime - a.start_datetime).total_seconds(),
+                (b.end_datetime - b.start_datetime).total_seconds(),
+            )
+            return overlap > 0 and shorter > 0 and overlap >= cls.DUPLICATE_WORKOUT_OVERLAP * shorter
+
+        kept: list[tuple[EventRecord, DataSource]] = []
+        for record, source in records:
+            duplicate = any(
+                other_source.provider != source.provider
+                and rank(other_source.provider) < rank(source.provider)
+                and same_session(record, other)
+                for other, other_source in records
+            )
+            if not duplicate:
+                kept.append((record, source))
+        return kept
+
     @handle_exceptions
     def get_workouts(
         self,
         db_session: DbSession,
         user_id: UUID,
         params: EventRecordQueryParams,
+        filter_by_priority: bool = False,
     ) -> PaginatedResponse[Workout]:
         params.category = "workout"
         records, total_count = self._get_records_with_filters(db_session, params, str(user_id))
@@ -726,6 +772,12 @@ class EventRecordService(
                 else:
                     first_record, _ = records[0]
                     previous_cursor = encode_cursor(first_record.start_datetime, first_record.id, "prev")
+
+        if filter_by_priority:
+            # After paging, so cursors still follow the stored rows; a copy whose original
+            # sits on the neighbouring page is not caught.
+            provider_order = self.priority_service.priority_repo.get_priority_order(db_session)
+            records = self._drop_duplicate_workouts(records, provider_order)
 
         computed_hr = self._resolve_avg_hr(db_session, [r for r, _ in records])
 

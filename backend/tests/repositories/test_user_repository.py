@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.models import User
 from app.repositories.user_repository import UserRepository
-from app.schemas.model_crud.user_management import UserCreateInternal, UserUpdateInternal
+from app.schemas.model_crud.user_management import UserCreateInternal, UserQueryParams, UserUpdateInternal
 from tests.factories import UserFactory
 
 
@@ -132,6 +132,17 @@ class TestUserRepository:
         assert len(results) == 1
         assert results[0].email == "test1@example.com"
         assert results[0].id == user1.id
+
+    def test_search_matches_external_user_id(self, db: Session, user_repo: UserRepository) -> None:
+        """A user created with only an external id (no email or name) is found by searching that id."""
+        external_id = str(uuid4())
+        user = UserFactory(email=None, first_name=None, last_name=None, external_user_id=external_id)
+        UserFactory(external_user_id=str(uuid4()))
+
+        results, total = user_repo.get_users_with_filters(db, UserQueryParams(search=external_id[:13]))
+
+        assert total == 1
+        assert results[0][0].id == user.id
 
     def test_get_all_with_pagination(self, db: Session, user_repo: UserRepository) -> None:
         """Test pagination with offset and limit."""

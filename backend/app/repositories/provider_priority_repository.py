@@ -27,8 +27,15 @@ class ProviderPriorityRepository(
         return db_session.query(self.model).filter(self.model.provider == provider).one_or_none()
 
     def get_priority_order(self, db_session: DbSession) -> dict[ProviderName, int]:
-        priorities = self.get_all_ordered(db_session)
-        return {p.provider: p.priority for p in priorities}
+        """Stored priorities over DEFAULT_PROVIDER_PRIORITY.
+
+        Rows are only created on some write paths, so a provider without one falls back
+        to its default instead of ranking last (which put Apple Health ahead of a
+        Garmin that had no row).
+        """
+        order = dict(DEFAULT_PROVIDER_PRIORITY)
+        order.update({p.provider: p.priority for p in self.get_all_ordered(db_session)})
+        return order
 
     def get_next_priority(self, db_session: DbSession) -> int:
         """Get the next available priority number."""

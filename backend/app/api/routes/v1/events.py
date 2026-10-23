@@ -31,6 +31,14 @@ def list_workouts(
     record_type: str | None = None,
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    filter_by_priority: Annotated[
+        bool,
+        Query(
+            description="When true, a session recorded by two providers (e.g. Garmin and Garmin Connect's copy "
+            "in Apple Health) is returned once, from the higher-priority provider. Defaults to false for "
+            "backwards compatibility."
+        ),
+    ] = False,
 ) -> PaginatedResponse[Workout]:
     """Returns workout sessions."""
     params = EventRecordQueryParams(
@@ -40,7 +48,7 @@ def list_workouts(
         limit=limit,
         record_type=record_type,
     )
-    return event_record_service.get_workouts(db, user_id, params)
+    return event_record_service.get_workouts(db, user_id, params, filter_by_priority=filter_by_priority)
 
 
 @router.get("/users/{user_id}/events/workouts/{workout_id}/samples")

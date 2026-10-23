@@ -708,6 +708,52 @@ class DataPointSeriesRepository(
 
         return averages
 
+    def get_averages_by_provider_for_time_range(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_time: datetime,
+        end_time: datetime,
+        series_types: list[SeriesType],
+    ) -> dict[str, dict[SeriesType, float]]:
+        """Like get_averages_for_time_range, but one average per provider.
+
+        Returns {provider: {series_type: average}}, only for types the provider has data
+        for, so a caller can prefer one provider and fall back to another per type.
+        """
+        if not series_types:
+            raise ValueError("series_types cannot be empty")
+
+        type_ids = [get_series_type_id(t) for t in series_types]
+
+        results = (
+            db_session.query(
+                DataSource.provider,
+                self.model.series_type_definition_id,
+                func.avg(self.model.value).label("avg_value"),
+            )
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                self.model.recorded_at >= start_time,
+                self.model.recorded_at < end_time,
+                self.model.series_type_definition_id.in_(type_ids),
+            )
+            .group_by(DataSource.provider, self.model.series_type_definition_id)
+            .all()
+        )
+
+        averages: dict[str, dict[SeriesType, float]] = {}
+        for provider, type_id, avg_value in results:
+            if avg_value is None:
+                continue
+            try:
+                series_type = get_series_type_from_id(type_id)
+            except KeyError:
+                continue
+            averages.setdefault(str(provider), {})[series_type] = float(avg_value)
+        return averages
+
     def get_daily_activity_aggregates(
         self,
         db_session: DbSession,

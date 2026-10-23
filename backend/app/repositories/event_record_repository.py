@@ -661,25 +661,36 @@ class EventRecordRepository(
             subquery.c.nap_duration,
         )
 
-        # Handle cursor pagination
+        # Handle cursor pagination. A page is a run of nights, not of rows: one night has a
+        # row per source (Garmin, the Apple Watch, the iPhone...) and the service keeps one
+        # of them, so the cursor moves by date and the limit counts dates.
         if cursor:
-            cursor_ts, cursor_id, direction = decode_cursor(cursor)
+            cursor_ts, _cursor_id, direction = decode_cursor(cursor)
             cursor_date = cursor_ts.date()
 
             if direction == "prev":
-                # Backward pagination: get items BEFORE cursor
-                query = query.filter(tuple_(subquery.c.sleep_date, record_id_col) < (cursor_date, cursor_id))
+                # Backward pagination: get nights BEFORE cursor
+                query = query.filter(subquery.c.sleep_date < cursor_date)
                 query = query.order_by(desc(subquery.c.sleep_date), desc(record_id_col))
             else:
-                # Forward pagination: get items AFTER cursor
-                query = query.filter(tuple_(subquery.c.sleep_date, record_id_col) > (cursor_date, cursor_id))
+                # Forward pagination: get nights AFTER cursor
+                query = query.filter(subquery.c.sleep_date > cursor_date)
                 query = query.order_by(asc(subquery.c.sleep_date), asc(record_id_col))
         else:
             # No cursor: default ordering
             query = query.order_by(asc(subquery.c.sleep_date), asc(record_id_col))
 
-        # Limit + 1 to check for has_more
-        results = query.limit(limit + 1).all()
+        # Every source's row for the first limit + 1 nights (the extra night tells has_more).
+        # The date range bounds the rows, so they're cut here rather than with a SQL LIMIT,
+        # which would count rows and drop the newest nights when a night has several sources.
+        results = []
+        nights: set = set()
+        for row in query.all():
+            if row.sleep_date not in nights:
+                if len(nights) == limit + 1:
+                    break
+                nights.add(row.sleep_date)
+            results.append(row)
 
         # Transform results to dict format
         summaries = []

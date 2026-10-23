@@ -42,10 +42,20 @@ class ProviderName(str, Enum):
         return cls.UNKNOWN
 
 
+# Lower = preferred. A wearable the user connected (its own cloud account) beats the
+# phone's health store: Apple Health, Samsung Health and Health Connect also hold copies
+# of whatever other apps wrote into them, so they are the fallback for days and metrics
+# the wearable has nothing for. Rows in provider_priority override these.
 DEFAULT_PROVIDER_PRIORITY: dict[ProviderName, int] = {
-    ProviderName.APPLE: 1,
-    ProviderName.GARMIN: 2,
-    ProviderName.POLAR: 3,
-    ProviderName.SUUNTO: 4,
-    ProviderName.WHOOP: 5,
+    ProviderName.GARMIN: 1,
+    ProviderName.POLAR: 2,
+    ProviderName.SUUNTO: 3,
+    ProviderName.WHOOP: 4,
+    ProviderName.OURA: 5,
+    ProviderName.FITBIT: 6,
+    ProviderName.ULTRAHUMAN: 7,
+    ProviderName.STRAVA: 8,
+    ProviderName.APPLE: 20,
+    ProviderName.SAMSUNG: 21,
+    ProviderName.GOOGLE: 22,
 }
