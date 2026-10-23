@@ -691,6 +691,41 @@ class TestGarminDeregistrationWebhook:
         task_db.refresh(connection)
         assert connection.status == ConnectionStatus.REVOKED
 
+    @patch("app.services.providers.garmin.handlers.lifecycle.schedule_provider_data_deletion")
+    def test_push_webhook_deregistration_queues_data_deletion(
+        self,
+        mock_schedule: MagicMock,
+        task_db: Session,
+        mock_external_apis: dict[str, MagicMock],
+    ) -> None:
+        """A deregistration queues deletion of the user's Garmin data."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin", provider_user_id="garmin_user_del")
+
+        process_webhook_push.run("garmin", {"deregistrations": [{"userId": "garmin_user_del"}]}, "trace-033")
+
+        mock_schedule.assert_called_once_with(user.id, "garmin", reason="deregistration")
+
+    @patch("app.services.providers.garmin.handlers.lifecycle.schedule_provider_data_deletion")
+    def test_push_webhook_deregistration_revokes_every_linked_user(
+        self,
+        mock_schedule: MagicMock,
+        task_db: Session,
+        mock_external_apis: dict[str, MagicMock],
+    ) -> None:
+        """Every OW user linked to the deregistered Garmin account is revoked, not just the first."""
+        first = UserConnectionFactory(provider="garmin", provider_user_id="garmin_shared")
+        second = UserConnectionFactory(provider="garmin", provider_user_id="garmin_shared")
+
+        result = process_webhook_push.run("garmin", {"deregistrations": [{"userId": "garmin_shared"}]}, "trace-034")
+
+        assert result["deregistrations"]["revoked"] == 2
+        task_db.refresh(first)
+        task_db.refresh(second)
+        assert first.status == ConnectionStatus.REVOKED
+        assert second.status == ConnectionStatus.REVOKED
+        assert mock_schedule.call_count == 2
+
     def test_push_webhook_deregistration_unknown_user(
         self,
         task_db: Session,

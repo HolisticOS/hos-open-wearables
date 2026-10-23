@@ -8,12 +8,20 @@ from sqlalchemy.dialects.postgresql import insert
 from app.database import DbSession
 from app.models import HealthScore
 from app.repositories.repositories import CrudRepository
-from app.schemas.enums import HealthScoreCategory
+from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
 from app.utils.pagination import decode_cursor
 
 
 class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, HealthScoreUpdate]):
+    def delete_by_user_and_provider(self, db_session: DbSession, user_id: UUID, provider: ProviderName) -> int:
+        """Delete the user's health scores reported by one provider; returns the number deleted. Caller commits."""
+        return (
+            db_session.query(self.model)
+            .filter(and_(self.model.user_id == user_id, self.model.provider == provider))
+            .delete(synchronize_session=False)
+        )
+
     def get_by_all_components(self, db_session: DbSession, components: list[str]) -> list[HealthScore]:
         """Return health scores whose components JSONB contains all specified keys (?& operator)."""
         return db_session.query(HealthScore).filter(HealthScore.components.has_all(components)).all()

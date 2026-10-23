@@ -9,10 +9,25 @@ Tests cover:
 - DELETE /api/v1/users/{user_id} - delete user
 """
 
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock, patch
+
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from tests.factories import ApiKeyFactory, DeveloperFactory, UserFactory
+from app.models import DataSource, EventRecord, HealthScore, UserConnection
+from app.schemas.auth import ConnectionStatus
+from app.schemas.enums import ProviderName
+from app.services import user_service
+from tests.factories import (
+    ApiKeyFactory,
+    DataSourceFactory,
+    DeveloperFactory,
+    EventRecordFactory,
+    HealthScoreFactory,
+    UserConnectionFactory,
+    UserFactory,
+)
 from tests.utils import api_key_headers, developer_auth_headers
 
 
@@ -485,8 +500,8 @@ class TestDeleteUser:
         # Assert
         assert response.status_code == 401
 
-    def test_delete_user_requires_bearer_token(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
-        """Test deleting user requires bearer token, not API key."""
+    def test_delete_user_accepts_api_key(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
+        """A backend holding an API key can delete a user (e.g. on account deletion)."""
         # Arrange
         developer = DeveloperFactory(email="test@example.com", password="test123")
         api_key = ApiKeyFactory(developer=developer)
@@ -496,5 +511,69 @@ class TestDeleteUser:
         # Act
         response = client.delete(f"{api_v1_prefix}/users/{user.id}", headers=headers)
 
-        # Assert - API key auth is rejected, requires bearer token
+        # Assert
+        assert response.status_code == 200
+        assert user_service.get(db, user.id, raise_404=False) is None
+
+    def test_delete_user_rejects_invalid_api_key(self, client: TestClient, db: Session, api_v1_prefix: str) -> None:
+        user = UserFactory()
+
+        response = client.delete(f"{api_v1_prefix}/users/{user.id}", headers=api_key_headers("sk-wrong"))
+
         assert response.status_code == 401
+
+    def test_delete_user_deregisters_and_removes_data(
+        self, client: TestClient, db: Session, api_v1_prefix: str
+    ) -> None:
+        """Active cloud connections are deregistered (token refreshed first), then all data goes."""
+        user = UserFactory()
+        user_id = user.id
+        UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            access_token="stale_access",
+            refresh_token="refresh",
+            token_expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        )
+        UserConnectionFactory(user=user, provider="polar", status=ConnectionStatus.REVOKED, access_token=None)
+        garmin_source = DataSourceFactory(user=user, provider=ProviderName.GARMIN, source="garmin")
+        apple_source = DataSourceFactory(user=user, provider=ProviderName.APPLE)
+        EventRecordFactory(data_source=garmin_source)
+        EventRecordFactory(data_source=apple_source)
+        HealthScoreFactory(data_source=garmin_source)
+        source_ids = [garmin_source.id, apple_source.id]
+        refresh_response = MagicMock()
+        refresh_response.json.return_value = {"access_token": "fresh", "token_type": "Bearer", "expires_in": 86400}
+        headers = api_key_headers(ApiKeyFactory().id)
+
+        with (
+            patch("httpx.post", return_value=refresh_response),
+            patch("httpx.delete") as mock_delete,
+        ):
+            response = client.delete(f"{api_v1_prefix}/users/{user_id}", headers=headers)
+
+        assert response.status_code == 200
+        # Only the active Garmin connection is deregistered, with the refreshed token.
+        mock_delete.assert_called_once()
+        assert mock_delete.call_args.kwargs["headers"] == {"Authorization": "Bearer fresh"}
+        db.expire_all()
+        assert db.query(UserConnection).filter_by(user_id=user_id).count() == 0
+        assert db.query(DataSource).filter_by(user_id=user_id).count() == 0
+        assert db.query(EventRecord).filter(EventRecord.data_source_id.in_(source_ids)).count() == 0
+        assert db.query(HealthScore).filter_by(user_id=user_id).count() == 0
+
+    def test_delete_user_succeeds_when_deregistration_fails(
+        self, client: TestClient, db: Session, api_v1_prefix: str
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            token_expires_at=datetime.now(timezone.utc) + timedelta(hours=5),
+        )
+        headers = api_key_headers(ApiKeyFactory().id)
+
+        with patch("httpx.delete", side_effect=Exception("provider down")):
+            response = client.delete(f"{api_v1_prefix}/users/{user.id}", headers=headers)
+
+        assert response.status_code == 200

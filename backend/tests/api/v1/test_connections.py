@@ -9,9 +9,12 @@ Tests the /api/v1/users/{user_id}/connections endpoint including:
 - Error cases
 """
 
-from datetime import datetime, timezone
+from collections.abc import Generator
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
@@ -19,6 +22,19 @@ from app.models import UserConnection
 from app.schemas.auth import ConnectionStatus
 from tests.factories import ApiKeyFactory, UserConnectionFactory, UserFactory
 from tests.utils import api_key_headers
+
+GARMIN_TOKEN_URL = "https://diauth.garmin.com/di-oauth2-service/oauth/token"
+
+
+@pytest.fixture(autouse=True)
+def provider_network() -> Generator[dict[str, MagicMock], None, None]:
+    """Disconnect may refresh a token and call the provider: never reach the real provider in tests."""
+    with (
+        patch("httpx.post", side_effect=httpx.ConnectError("no network in tests")) as post,
+        patch("httpx.delete") as delete,
+        patch("app.services.user_connection_service.schedule_provider_data_deletion") as schedule,
+    ):
+        yield {"post": post, "delete": delete, "schedule": schedule}
 
 
 class TestConnectionsEndpoints:
@@ -482,6 +498,7 @@ class TestDisconnectDeregistration:
             provider="garmin",
             status=ConnectionStatus.ACTIVE,
             access_token="garmin_access_token",
+            token_expires_at=datetime.now(timezone.utc) + timedelta(hours=12),
         )
         api_key = ApiKeyFactory()
         headers = api_key_headers(api_key.id)
@@ -514,6 +531,7 @@ class TestDisconnectDeregistration:
             provider="garmin",
             status=ConnectionStatus.ACTIVE,
             access_token="garmin_access_token",
+            token_expires_at=datetime.now(timezone.utc) + timedelta(hours=12),
         )
         api_key = ApiKeyFactory()
         headers = api_key_headers(api_key.id)
@@ -538,6 +556,7 @@ class TestDisconnectDeregistration:
             provider="garmin",
             status=ConnectionStatus.ACTIVE,
             access_token=None,
+            refresh_token=None,
         )
         api_key = ApiKeyFactory()
         headers = api_key_headers(api_key.id)
@@ -548,3 +567,154 @@ class TestDisconnectDeregistration:
         # Assert
         assert response.status_code == 204
         mock_httpx_delete.assert_not_called()
+
+    @patch("httpx.delete")
+    def test_disconnect_refreshes_expired_token_before_deregistration(
+        self, mock_httpx_delete: MagicMock, client: TestClient, db: Session
+    ) -> None:
+        """An expired access token is refreshed first and the new token is used to deregister."""
+        refresh_response = MagicMock()
+        refresh_response.json.return_value = {
+            "access_token": "fresh_access",
+            "token_type": "Bearer",
+            "expires_in": 86400,
+            "refresh_token": "fresh_refresh",
+        }
+        user = UserFactory()
+        UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            status=ConnectionStatus.ACTIVE,
+            access_token="stale_access",
+            refresh_token="old_refresh",
+            token_expires_at=datetime.now(timezone.utc) - timedelta(hours=3),
+        )
+        headers = api_key_headers(ApiKeyFactory().id)
+
+        with patch("httpx.post", return_value=refresh_response) as mock_post:
+            response = client.delete(f"/api/v1/users/{user.id}/connections/garmin", headers=headers)
+
+        assert response.status_code == 204
+        assert mock_post.call_args.args[0] == GARMIN_TOKEN_URL
+        assert mock_post.call_args.kwargs["data"]["refresh_token"] == "old_refresh"
+        mock_httpx_delete.assert_called_once()
+        assert mock_httpx_delete.call_args.kwargs["headers"] == {"Authorization": "Bearer fresh_access"}
+        conn = db.query(UserConnection).filter_by(user_id=user.id, provider="garmin").one()
+        assert conn.status == ConnectionStatus.REVOKED
+        assert conn.access_token is None
+        assert conn.refresh_token is None
+
+    @patch("httpx.delete")
+    def test_disconnect_refreshes_token_inside_margin(
+        self, mock_httpx_delete: MagicMock, client: TestClient, db: Session
+    ) -> None:
+        """A token with less than 10 minutes left counts as expired."""
+        refresh_response = MagicMock()
+        refresh_response.json.return_value = {
+            "access_token": "fresh_access",
+            "token_type": "Bearer",
+            "expires_in": 86400,
+        }
+        user = UserFactory()
+        UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            access_token="nearly_expired",
+            token_expires_at=datetime.now(timezone.utc) + timedelta(minutes=8),
+        )
+        headers = api_key_headers(ApiKeyFactory().id)
+
+        with patch("httpx.post", return_value=refresh_response) as mock_post:
+            client.delete(f"/api/v1/users/{user.id}/connections/garmin", headers=headers)
+
+        mock_post.assert_called_once()
+        assert mock_httpx_delete.call_args.kwargs["headers"] == {"Authorization": "Bearer fresh_access"}
+
+    @patch("httpx.delete")
+    def test_disconnect_does_not_refresh_live_token(
+        self, mock_httpx_delete: MagicMock, client: TestClient, db: Session
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            access_token="live_access",
+            token_expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        )
+        headers = api_key_headers(ApiKeyFactory().id)
+
+        with patch("httpx.post") as mock_post:
+            client.delete(f"/api/v1/users/{user.id}/connections/garmin", headers=headers)
+
+        mock_post.assert_not_called()
+        assert mock_httpx_delete.call_args.kwargs["headers"] == {"Authorization": "Bearer live_access"}
+
+    @patch("httpx.delete")
+    def test_disconnect_when_refresh_is_rejected_still_revokes(
+        self, mock_httpx_delete: MagicMock, client: TestClient, db: Session
+    ) -> None:
+        """Refresh rejected: deregistration is still tried with the stored token and the connection is revoked."""
+        rejected = MagicMock()
+        rejected.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "rejected", request=MagicMock(), response=MagicMock(status_code=400, text="invalid_grant")
+        )
+        user = UserFactory()
+        UserConnectionFactory(
+            user=user,
+            provider="garmin",
+            access_token="stale_access",
+            refresh_token="dead_refresh",
+            token_expires_at=datetime.now(timezone.utc) - timedelta(days=2),
+        )
+        headers = api_key_headers(ApiKeyFactory().id)
+
+        with patch("httpx.post", return_value=rejected):
+            response = client.delete(f"/api/v1/users/{user.id}/connections/garmin", headers=headers)
+
+        assert response.status_code == 204
+        assert mock_httpx_delete.call_args.kwargs["headers"] == {"Authorization": "Bearer stale_access"}
+        conn = db.query(UserConnection).filter_by(user_id=user.id, provider="garmin").one()
+        assert conn.status == ConnectionStatus.REVOKED
+        # Tokens are cleared even though the failed refresh had already marked it revoked.
+        assert conn.access_token is None
+        assert conn.refresh_token is None
+
+
+class TestDisconnectDataDeletion:
+    """Disconnecting a cloud provider queues deletion of that provider's data."""
+
+    def test_cloud_disconnect_queues_deletion(
+        self, client: TestClient, db: Session, provider_network: dict[str, MagicMock]
+    ) -> None:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="garmin", token_expires_at=datetime.now(timezone.utc) + timedelta(1))
+        headers = api_key_headers(ApiKeyFactory().id)
+
+        response = client.delete(f"/api/v1/users/{user.id}/connections/garmin", headers=headers)
+
+        assert response.status_code == 204
+        provider_network["schedule"].assert_called_once_with(user.id, "garmin", reason="disconnect")
+
+    def test_sdk_disconnect_keeps_data(
+        self, client: TestClient, db: Session, provider_network: dict[str, MagicMock]
+    ) -> None:
+        """SDK providers (e.g. Apple Health) have no OAuth: disconnecting never deletes their data."""
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider="apple", access_token=None, refresh_token=None)
+        headers = api_key_headers(ApiKeyFactory().id)
+
+        response = client.delete(f"/api/v1/users/{user.id}/connections/apple", headers=headers)
+
+        assert response.status_code == 204
+        provider_network["schedule"].assert_not_called()
+
+    def test_missing_connection_queues_nothing(
+        self, client: TestClient, db: Session, provider_network: dict[str, MagicMock]
+    ) -> None:
+        user = UserFactory()
+        headers = api_key_headers(ApiKeyFactory().id)
+
+        response = client.delete(f"/api/v1/users/{user.id}/connections/garmin", headers=headers)
+
+        assert response.status_code == 404
+        provider_network["schedule"].assert_not_called()

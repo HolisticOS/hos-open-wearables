@@ -1,6 +1,7 @@
 import logging
 
 import httpx
+from starlette.status import HTTP_502_BAD_GATEWAY
 
 from app.config import settings
 from app.schemas.auth import (
@@ -12,7 +13,8 @@ from app.schemas.model_crud.credentials import (
     ProviderCredentials,
     ProviderEndpoints,
 )
-from app.services.providers.templates.base_oauth import BaseOAuthTemplate
+from app.services.providers.templates.base_oauth import BaseOAuthTemplate, OAuthConnectionError
+from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,9 @@ class GarminOAuth(BaseOAuthTemplate):
 
     use_pkce = True
     auth_method = AuthenticationMethod.BODY
+    # Garmin pushes data per Garmin account. Linking one account to several OW
+    # users would duplicate every push, so the newest connection wins.
+    single_owner_per_account = True
 
     def deregister_user(self, access_token: str) -> None:
         """Call Garmin's user deregistration endpoint to remove the app association."""
@@ -49,8 +54,13 @@ class GarminOAuth(BaseOAuthTemplate):
         response.raise_for_status()
 
     def _get_provider_user_info(self, token_response: OAuthTokenResponse, user_id: str) -> dict[str, str | None]:
-        """Fetches Garmin user ID and API permissions."""
-        # Fetch user ID (critical - fail returns all None)
+        """Fetches Garmin user ID and API permissions.
+
+        The Garmin user ID is required: pushes are matched to a connection by it,
+        so a connection saved without it would silently drop every push. If it
+        cannot be fetched the connection fails (OAuthConnectionError) instead.
+        """
+        provider_user_id: str | None = None
         try:
             user_id_response = httpx.get(
                 f"{self.api_base_url}/partner-gateway/rest/user/id",
@@ -58,9 +68,26 @@ class GarminOAuth(BaseOAuthTemplate):
                 timeout=30.0,
             )
             user_id_response.raise_for_status()
-            provider_user_id = user_id_response.json().get("userId")
-        except Exception:
-            return {"user_id": None, "username": None, "scope": None}
+            raw_user_id = user_id_response.json().get("userId")
+            provider_user_id = str(raw_user_id) if raw_user_id else None
+            failure = None if provider_user_id else "response had no user id"
+        except Exception as e:
+            failure = str(e)
+
+        if not provider_user_id:
+            log_structured(
+                logger,
+                "error",
+                f"Garmin user id lookup failed, connection not saved: {failure}",
+                provider="garmin",
+                task="get_provider_user_info",
+                user_id=user_id,
+            )
+            raise OAuthConnectionError(
+                "provider_user_lookup_failed",
+                "Could not fetch the Garmin user id; the connection was not saved",
+                status_code=HTTP_502_BAD_GATEWAY,
+            )
 
         # Fetch permissions (best-effort - fail returns scope as None)
         scope: str | None = None

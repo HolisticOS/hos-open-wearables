@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from base64 import b64encode, urlsafe_b64encode
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID
 
 import httpx
@@ -15,6 +16,7 @@ from starlette.status import HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED, HTTP_5
 
 from app.database import DbSession
 from app.integrations.redis_client import get_redis_client
+from app.models import UserConnection
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import AuthenticationMethod, ConnectionStatus
@@ -29,6 +31,22 @@ from app.services.outgoing_webhooks.events import on_connection_created, on_conn
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
+
+# Refresh an access token this long before it expires. Shared by API calls and
+# deregistration, so a token is never used in its last minutes.
+TOKEN_REFRESH_MARGIN = timedelta(minutes=10)
+
+
+class OAuthConnectionError(HTTPException):
+    """An OAuth callback failure with a short machine-readable reason.
+
+    The callback route forwards ``reason`` to the client's redirect_uri as
+    ``error=<reason>``.
+    """
+
+    def __init__(self, reason: str, detail: str, status_code: int = HTTP_400_BAD_REQUEST):
+        super().__init__(status_code=status_code, detail=detail)
+        self.reason = reason
 
 
 class BaseOAuthTemplate(ABC):
@@ -66,6 +84,11 @@ class BaseOAuthTemplate(ABC):
 
     use_pkce: bool = False
     auth_method: AuthenticationMethod = AuthenticationMethod.BASIC_AUTH
+    # When True, one provider account can be linked to only one OW user at a
+    # time: a new connection revokes any other active connection for the same
+    # provider_user_id (latest wins). Off by default because sharing one provider
+    # account across several OW users is a supported feature (linked_user_ids).
+    single_owner_per_account: bool = False
 
     def get_authorization_url(self, user_id: UUID, redirect_uri: str | None = None) -> tuple[str, str]:
         """Generates the provider's authorization URL.
@@ -102,8 +125,21 @@ class BaseOAuthTemplate(ABC):
 
     def handle_callback(self, db: DbSession, code: str, state: str) -> OAuthState:
         """Handles the OAuth callback, exchanges code, and saves the connection."""
-        oauth_state, code_verifier = self._validate_state(state)
+        oauth_state, code_verifier = self.consume_state(state)
+        return self.complete_callback(db, code, oauth_state, code_verifier)
 
+    def consume_state(self, state: str) -> tuple[OAuthState, str | None]:
+        """Validate and consume (one-time) the OAuth state. Raises 400 if missing or expired."""
+        return self._validate_state(state)
+
+    def complete_callback(
+        self,
+        db: DbSession,
+        code: str,
+        oauth_state: OAuthState,
+        code_verifier: str | None,
+    ) -> OAuthState:
+        """Exchange the code for tokens and save the connection for an already-consumed state."""
         if oauth_state.provider != self.provider_name:
             log_structured(
                 logger,
@@ -114,7 +150,7 @@ class BaseOAuthTemplate(ABC):
                 user_id=str(oauth_state.user_id),
                 state_provider=oauth_state.provider,
             )
-            raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="Provider mismatch in state")
+            raise OAuthConnectionError("provider_mismatch", "Provider mismatch in state")
 
         token_response = self._exchange_token(code, code_verifier)
 
@@ -197,6 +233,20 @@ class BaseOAuthTemplate(ABC):
             )
             raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Token refresh failed: {str(e)}")
 
+    def ensure_fresh_access_token(self, db: DbSession, connection: UserConnection) -> str | None:
+        """Return a usable access token, refreshing first if it expires within TOKEN_REFRESH_MARGIN.
+
+        Returns the stored token when no refresh is needed or possible (no refresh
+        token). Raises HTTPException if the refresh itself fails.
+        """
+        expires_at = connection.token_expires_at
+        if expires_at is not None and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        needs_refresh = expires_at is None or expires_at <= datetime.now(timezone.utc) + TOKEN_REFRESH_MARGIN
+        if not needs_refresh or not connection.refresh_token:
+            return connection.access_token
+        return self.refresh_access_token(db, connection.user_id, connection.refresh_token).access_token
+
     def _revoke_connection(self, db: DbSession, user_id: UUID, *, reason: str) -> None:
         """Mark the connection revoked and emit a connection.revoked webhook."""
         connection = self.connection_repo.get_by_user_and_provider(db, user_id, self.provider_name)
@@ -235,8 +285,6 @@ class BaseOAuthTemplate(ABC):
         )
 
         if self.credentials.default_scope:
-            from urllib.parse import quote
-
             encoded_scope = quote(self.credentials.default_scope)
             auth_url += f"&scope={encoded_scope}"
 
@@ -293,9 +341,9 @@ class BaseOAuthTemplate(ABC):
                 task="exchange_token",
                 status_code=e.response.status_code,
             )
-            raise HTTPException(
-                status_code=HTTP_400_BAD_REQUEST,
-                detail=f"Failed to exchange authorization code: {e.response.text}",
+            raise OAuthConnectionError(
+                "token_exchange_failed",
+                f"Failed to exchange authorization code: {e.response.text}",
             )
         except Exception as e:
             log_structured(
@@ -305,7 +353,11 @@ class BaseOAuthTemplate(ABC):
                 provider=self.provider_name,
                 task="exchange_token",
             )
-            raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Token exchange failed: {str(e)}")
+            raise OAuthConnectionError(
+                "token_exchange_failed",
+                f"Token exchange failed: {str(e)}",
+                status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
     def _prepare_token_request(self, code: str, code_verifier: str | None) -> tuple[dict, dict]:
         """Prepares the token exchange request. Default implementation uses Basic Auth."""
@@ -419,4 +471,40 @@ class BaseOAuthTemplate(ABC):
                 provider=self.provider_name,
                 connection_id=new_connection.id,  # ty:ignore[unresolved-attribute]
                 connected_at=new_connection.created_at.isoformat(),  # ty:ignore[unresolved-attribute]
+            )
+
+        if self.single_owner_per_account and provider_user_id:
+            self._revoke_other_owners(db, user_id, provider_user_id)
+
+    def _revoke_other_owners(self, db: DbSession, user_id: UUID, provider_user_id: str) -> None:
+        """Latest wins: revoke other OW users' active connections to the same provider account.
+
+        Local revoke only (tokens cleared, status revoked). No provider-side
+        deregistration: the provider account is the same one the new connection
+        uses, so deregistering it would cut off the new connection too.
+        """
+        others = [
+            c
+            for c in self.connection_repo.get_all_by_provider_user_id(db, self.provider_name, provider_user_id)
+            if c.user_id != user_id
+        ]
+        for other in others:
+            if not self.connection_repo.disconnect(db, other.user_id, self.provider_name):
+                continue
+            log_structured(
+                logger,
+                "warning",
+                "Provider account re-linked to a different user; revoked the older connection",
+                provider=self.provider_name,
+                task="save_connection",
+                user_id=str(user_id),
+                revoked_user_id=str(other.user_id),
+                revoked_connection_id=str(other.id),
+            )
+            on_connection_revoked(
+                user_id=other.user_id,
+                provider=self.provider_name,
+                connection_id=other.id,
+                reason="linked_to_another_user",
+                revoked_at=datetime.now(timezone.utc).isoformat(),
             )

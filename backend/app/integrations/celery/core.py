@@ -101,6 +101,7 @@ def create_celery() -> Celery:
             "app.integrations.celery.tasks.process_sdk_upload_task.process_sdk_upload": {"queue": "sdk_sync"},
             # Tiny and latency-sensitive: keep it off "default", where long periodic syncs run.
             "app.integrations.celery.tasks.notify_hos_task.notify_hos": {"queue": "webhook_sync"},
+            "app.integrations.celery.tasks.garmin.token_refresh_task.refresh_garmin_tokens": {"queue": "garmin_sync"},
         },
     )
 
@@ -147,6 +148,14 @@ def create_celery() -> Celery:
         "fill-missing-resilience-scores": {
             "task": "app.integrations.celery.tasks.fill_missing_resilience_scores_task.fill_missing_resilience_scores",
             "schedule": float(settings.resilience_score_interval_seconds),
+            "args": (),
+            "kwargs": {},
+        },
+        "refresh-garmin-tokens-daily": {
+            # Push-only Garmin connections never call the API, so keep their refresh
+            # tokens rotating; otherwise later deregistration becomes impossible.
+            "task": "app.integrations.celery.tasks.garmin.token_refresh_task.refresh_garmin_tokens",
+            "schedule": crontab(hour=4, minute=30),  # Daily at 04:30 UTC
             "args": (),
             "kwargs": {},
         },

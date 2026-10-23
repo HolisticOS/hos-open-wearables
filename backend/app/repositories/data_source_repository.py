@@ -176,6 +176,18 @@ class DataSourceRepository(
             .all()
         )
 
+    def delete_by_user_and_provider(self, db_session: DbSession, user_id: UUID, provider: ProviderName) -> int:
+        """Delete the user's data sources for one provider; returns the number deleted.
+
+        Event records (and their detail rows), data point series and archived
+        aggregates cascade at the database level. Caller commits.
+        """
+        return (
+            db_session.query(self.model)
+            .filter(and_(self.model.user_id == user_id, self.model.provider == provider))
+            .delete(synchronize_session=False)
+        )
+
     def infer_provider_from_source(self, source: str | None) -> ProviderName:
         """Infer provider from source string.
 

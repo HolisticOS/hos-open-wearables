@@ -7,6 +7,7 @@ from pydantic import ValidationError
 from app.database import DbSession
 from app.models import User
 from app.repositories.user_repository import UserRepository
+from app.schemas.auth import ConnectionStatus
 from app.schemas.model_crud.user_management import (
     UserCreate,
     UserCreateInternal,
@@ -61,19 +62,25 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
         return self.crud.update(db_session, user, internal_updater)
 
     def delete(self, db_session: DbSession, object_id: UUID | str | int, raise_404: bool = False) -> User | None:
-        """Delete a user by ID."""
+        """Delete a user by ID.
+
+        Each active cloud connection is deregistered with its provider first
+        (best-effort, refreshing an expired token). Deleting the user row then
+        removes all of the user's data: connections, data sources and everything
+        under them, health scores, etc. cascade at the database level.
+        """
         user = self.get(db_session, object_id, raise_404=raise_404)
         if not user:
             return None
         provider_factory = ProviderFactory()
         connections = list(user_connection_service.get_connections_by_user(db_session, user.id))
         for connection in connections:
-            if not connection.access_token:
+            if connection.status != ConnectionStatus.ACTIVE:
                 continue
             try:
                 strategy = provider_factory.get_provider(connection.provider)
                 if oauth := strategy.oauth:
-                    oauth.deregister_user(connection.access_token)
+                    user_connection_service.deregister_connection(db_session, connection, oauth)
             except Exception as e:
                 log_structured(
                     self.logger,

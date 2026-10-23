@@ -1,17 +1,18 @@
 from __future__ import annotations
 
+import json
 import warnings
 from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import quote
 
 if TYPE_CHECKING:
     from app.schemas.enums import ProviderName
 
 from pydantic import AnyHttpUrl, Field, SecretStr, ValidationInfo, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from app.utils.config_utils import (
     EncryptedField,
@@ -97,6 +98,10 @@ class Settings(BaseSettings):
     # Pre-0.4.2 behaviour. Set to false once your integration calls /sync/historical explicitly.
     # Will default to false in a future release.
     historical_sync_on_connect: bool = True
+    # Providers that never get the automatic on-connect historical sync, even when
+    # historical_sync_on_connect is true. Comma-separated, e.g. "garmin" for a
+    # push-only Garmin app that has no backfill access. Empty = no exceptions.
+    historical_sync_disabled_providers: Annotated[list[str], NoDecode] = []
 
     # Whether to ingest per-second workout samples (speed, cadence, power, GPS, etc.) into
     # data_point_series on workout webhook arrival. Significantly increases DB storage.
@@ -116,6 +121,18 @@ class Settings(BaseSettings):
 
     # API SETTINGS
     api_base_url: str = "http://localhost:8000"
+
+    # OAUTH REDIRECT SETTINGS
+    # Where the member may be sent after a provider OAuth flow (the authorize
+    # endpoint's redirect_uri). URLs under API_BASE_URL and FRONTEND_URL are always
+    # allowed; add more prefixes here, comma-separated (e.g. a mobile deep link
+    # "myapp://providers/connected"). Anything else is rejected with 400.
+    oauth_allowed_redirect_prefixes: Annotated[list[str], NoDecode] = []
+
+    # DATA DELETION
+    # When a cloud provider is disconnected (via the API or the provider's own
+    # deregistration notice), delete that user's data that came from that provider.
+    delete_provider_data_on_disconnect: bool = True
 
     # SUUNTO OAUTH SETTINGS
     suunto_client_id: str | None = None
@@ -315,6 +332,22 @@ class Settings(BaseSettings):
 
         # This should never be reached given the type annotation, but ensures type safety
         raise ValueError(f"Unexpected type for cors_origins: {type(v)}")
+
+    @field_validator("oauth_allowed_redirect_prefixes", "historical_sync_disabled_providers", mode="before")
+    @classmethod
+    def _split_comma_list(cls, v: Any) -> Any:
+        """Accept a comma-separated string (or a JSON list) for list settings."""
+        if isinstance(v, str):
+            raw = v.strip()
+            if raw.startswith("["):
+                return [str(i).strip() for i in json.loads(raw) if str(i).strip()]
+            return [i.strip() for i in raw.split(",") if i.strip()]
+        return v
+
+    @field_validator("historical_sync_disabled_providers", mode="after")
+    @classmethod
+    def _lowercase_providers(cls, v: list[str]) -> list[str]:
+        return [i.lower() for i in v]
 
     @field_validator("pull_sync_lookback", mode="before")
     @classmethod

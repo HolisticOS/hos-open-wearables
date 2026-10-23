@@ -3,7 +3,7 @@ from logging import getLogger
 from typing import cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import CursorResult, and_, func, select, tuple_, update
+from sqlalchemy import CursorResult, and_, func, or_, select, tuple_, update
 from sqlalchemy.orm import Query
 from sqlalchemy.orm.exc import MultipleResultsFound
 
@@ -249,25 +249,38 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             .all()
         )
 
-    def get_expiring_tokens(self, db_session: DbSession, minutes_threshold: int = 5) -> list[UserConnection]:
-        """Get connections with tokens expiring soon (for background refresh)."""
+    def get_expiring_tokens(
+        self,
+        db_session: DbSession,
+        minutes_threshold: int = 5,
+        provider: str | None = None,
+        require_refresh_token: bool = False,
+    ) -> list[UserConnection]:
+        """Get active connections whose access token expires within minutes_threshold (or already expired).
+
+        Optionally limited to one provider and to connections that still hold a refresh token.
+        """
         now = datetime.now(timezone.utc)
 
         threshold_time = now + timedelta(minutes=minutes_threshold)
 
-        return (
-            db_session.query(self.model)
-            .filter(
-                and_(
-                    self.model.status == ConnectionStatus.ACTIVE,
-                    self.model.token_expires_at <= threshold_time,
-                ),
-            )
-            .all()
-        )
+        filters = [
+            self.model.status == ConnectionStatus.ACTIVE,
+            self.model.token_expires_at <= threshold_time,
+        ]
+        if provider is not None:
+            filters.append(self.model.provider == provider)
+        if require_refresh_token:
+            filters.append(self.model.refresh_token.isnot(None))
+
+        return db_session.query(self.model).filter(and_(*filters)).all()
 
     def disconnect(self, db_session: DbSession, user_id: UUID, provider: str) -> int:
-        """Disconnect a provider in a single UPDATE query. Returns number of rows updated."""
+        """Disconnect a provider in a single UPDATE query. Returns number of rows updated.
+
+        Also clears tokens left on a connection that was already marked revoked
+        (e.g. by a failed refresh), so a disconnect never leaves tokens behind.
+        """
         result = cast(
             CursorResult[tuple[()]],
             db_session.execute(
@@ -276,7 +289,11 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                     and_(
                         UserConnection.user_id == user_id,
                         UserConnection.provider == provider,
-                        UserConnection.status != ConnectionStatus.REVOKED,
+                        or_(
+                            UserConnection.status != ConnectionStatus.REVOKED,
+                            UserConnection.access_token.isnot(None),
+                            UserConnection.refresh_token.isnot(None),
+                        ),
                     ),
                 )
                 .values(
@@ -346,7 +363,9 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             connection.refresh_token = refresh_token
         connection.token_expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-        if provider_user_id and not connection.provider_user_id:
+        # The provider's answer is the truth: a user who reconnects with a different
+        # provider account must be matched by the new account id from now on.
+        if provider_user_id and connection.provider_user_id != provider_user_id:
             connection.provider_user_id = provider_user_id
         if provider_username and not connection.provider_username:
             connection.provider_username = provider_username

@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react';
 import { API_CONFIG } from '@/lib/api/config';
+import { getToken } from '@/lib/auth/session';
 
 export type OAuthConnectionState = 'idle' | 'connecting' | 'success' | 'error';
 
@@ -58,8 +59,11 @@ export function useOAuthConnect(
           redirect_uri: finalRedirectUri,
         });
 
+        // The authorize endpoint requires a developer session (or an API key).
+        const token = getToken();
         const response = await fetch(
-          `${API_CONFIG.baseUrl}/api/v1/oauth/${providerId}/authorize?${params}`
+          `${API_CONFIG.baseUrl}/api/v1/oauth/${providerId}/authorize?${params}`,
+          token ? { headers: { Authorization: `Bearer ${token}` } } : undefined
         );
 
         if (!response.ok) {

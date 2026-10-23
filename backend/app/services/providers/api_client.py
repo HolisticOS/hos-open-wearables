@@ -2,7 +2,7 @@
 
 import logging
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
@@ -11,7 +11,7 @@ from fastapi import HTTPException, status
 
 from app.database import DbSession
 from app.repositories import UserConnectionRepository
-from app.services.providers.templates.base_oauth import BaseOAuthTemplate
+from app.services.providers.templates.base_oauth import TOKEN_REFRESH_MARGIN, BaseOAuthTemplate
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
@@ -46,8 +46,8 @@ def _get_valid_token(
             detail=f"No access token available for {provider_name} (SDK-based provider?)",
         )
 
-    # Check if token is expired (with 5 minute buffer)
-    if connection.token_expires_at and connection.token_expires_at < datetime.now(timezone.utc) + timedelta(minutes=5):
+    # Check if token is expired (refresh TOKEN_REFRESH_MARGIN before expiry)
+    if connection.token_expires_at and connection.token_expires_at < datetime.now(timezone.utc) + TOKEN_REFRESH_MARGIN:
         if not connection.refresh_token:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,

@@ -120,13 +120,17 @@ Once you get access to the Developer Portal, you’ll find the full docs, includ
     - For **every** endpoint, set the URL to your Open Wearables webhook push endpoint:
 
     ```
-    https://<your-domain>/api/v1/garmin/webhooks/push
+    https://<your-domain>/api/v1/providers/garmin/webhooks
     ```
 
     For local development with ngrok:
     ```
-    https://<your-ngrok-id>.ngrok-free.app/api/v1/garmin/webhooks/push
+    https://<your-ngrok-id>.ngrok-free.app/api/v1/providers/garmin/webhooks
     ```
+
+    <Note>
+    `/api/v1/providers/garmin/webhooks` is the canonical URL. The older `/api/v1/garmin/webhooks/push` path is kept only for existing setups and is deprecated.
+    </Note>
 
     - Set delivery type to **push** (dropdown on the right)
     - Check **enabled** for each endpoint you want to activate
@@ -179,7 +183,31 @@ GARMIN_REDIRECT_URI=https://yourdomain.com/api/v1/oauth/garmin/callback
     <Note>
     If you later move from evaluation to production, you’ll update these credentials to the production ones.
     </Note>
-  </Step> 
+  </Step>
+  <Step title="Configure connect, redirect and disconnect behaviour">
+    These settings control what happens around a Garmin connection:
+
+```bash
+# Push-only apps (no historical backfill access): skip the on-connect backfill for
+# Garmin only. Other OAuth providers keep their automatic historical sync.
+HISTORICAL_SYNC_DISABLED_PROVIDERS=garmin
+
+# Extra places the user may be sent after authorizing (the authorize endpoint's
+# redirect_uri). URLs under API_BASE_URL and FRONTEND_URL are always allowed;
+# anything else is rejected with 400. Comma-separated prefixes, e.g. a mobile deep link.
+OAUTH_ALLOWED_REDIRECT_PREFIXES=myapp://providers/connected
+
+# Delete the user's Garmin-sourced data when Garmin is disconnected
+# (via the API or a Garmin deregistration notification). Default: true.
+DELETE_PROVIDER_DATA_ON_DISCONNECT=true
+```
+
+    - **Historical sync on connect.** If your app has no backfill access (push-only), set `HISTORICAL_SYNC_DISABLED_PROVIDERS=garmin` rather than turning `HISTORICAL_SYNC_ON_CONNECT` off: the global flag would also stop the 90-day backfill for every other OAuth provider. `HISTORICAL_SYNC_ON_CONNECT=false` still disables it for all providers.
+    - **Starting a connection.** `GET /api/v1/oauth/garmin/authorize?user_id=...&redirect_uri=...` requires an API key (`X-Open-Wearables-API-Key`) or a developer session, and the user must exist. After the flow the user is redirected to `redirect_uri` with `status=success&provider=garmin`, or with `status=error&error=<reason>` on failure (for example `access_denied` or `provider_user_lookup_failed`). Existing query parameters on `redirect_uri` are kept.
+    - **One Garmin account, one user.** Each Garmin account is linked to a single Open Wearables user. Connecting the same Garmin account to another user revokes the older connection.
+    - **Disconnecting.** `DELETE /api/v1/users/{user_id}/connections/garmin` deregisters the user with Garmin (refreshing an expired access token first), revokes the connection and queues deletion of that user's Garmin data. Garmin deregistration notifications do the same. Data from other providers is not touched. Deleting a user (`DELETE /api/v1/users/{user_id}`, API key or developer session) deregisters every active connection and deletes all of the user's data.
+    - **Token upkeep.** A daily background task refreshes Garmin tokens that are expired or about to expire, so the refresh token stays valid for later deregistration even when the app only receives pushes.
+  </Step>
   <Step title="Go to production (partner verification + production access)">
     Evaluation apps are for internal development. To go production, Garmin requires partner verification:
 

@@ -7,6 +7,7 @@ from app.models import UserConnection
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.model_crud.user_management import UserConnectionCreate, UserConnectionUpdate
 from app.schemas.responses.upload import ConnectionsCoverage, ProviderConnectionCount
+from app.services.provider_data_deletion import schedule_provider_data_deletion
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.services import AppService
 from app.utils.exceptions import ResourceNotFoundError, handle_exceptions
@@ -60,21 +61,24 @@ class UserConnectionService(
     ) -> None:
         """Disconnect a user from a provider. Raises 404 if connection not found.
 
-        If oauth is provided, calls the provider's deregistration API before clearing tokens.
-        Deregistration failures are logged but do not block the disconnect.
+        If oauth is provided (cloud providers), calls the provider's deregistration
+        API before clearing tokens, refreshing an expired token first. Deregistration
+        failures are logged but do not block the disconnect. Cloud providers also get
+        their data for this user deleted in the background (see
+        provider_data_deletion); SDK providers (no oauth) keep their data.
         """
-        if oauth:
-            self._deregister_from_provider(db_session, user_id, provider, oauth)
-
-        updated = self.crud.disconnect(db_session, user_id, provider)
-        if updated:
-            self.logger.info("Revoked connection for user %s from provider %s", user_id, provider)
-            return
-
-        # Nothing updated - check if connection exists (already revoked) or not found
         connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
         if not connection:
             raise ResourceNotFoundError("connection", user_id)
+
+        if oauth:
+            self.deregister_connection(db_session, connection, oauth)
+
+        if self.crud.disconnect(db_session, user_id, provider):
+            self.logger.info("Revoked connection for user %s from provider %s", user_id, provider)
+
+        if oauth:
+            schedule_provider_data_deletion(user_id, provider, reason="disconnect")
 
     @handle_exceptions
     def stamp_last_synced_at(self, db_session: DbSession, user_id: UUID, provider: str) -> None:
@@ -88,16 +92,37 @@ class UserConnectionService(
         if connection:
             self.crud.update_last_synced_at(db_session, connection)
 
-    def _deregister_from_provider(
-        self, db_session: DbSession, user_id: UUID, provider: str, oauth: BaseOAuthTemplate
+    def deregister_connection(
+        self, db_session: DbSession, connection: UserConnection, oauth: BaseOAuthTemplate
     ) -> None:
-        """Best-effort call to provider's deregistration API."""
-        connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
-        if not connection or not connection.access_token:
+        """Best-effort call to the provider's deregistration API.
+
+        Refreshes the access token first when it has expired or is about to
+        (provider access tokens can be short-lived). If the refresh fails the stored
+        token is tried anyway. Never raises: the caller revokes locally regardless.
+        """
+        user_id = connection.user_id
+        provider = connection.provider
+        if not connection.access_token and not connection.refresh_token:
+            return
+
+        access_token = connection.access_token
+        try:
+            access_token = oauth.ensure_fresh_access_token(db_session, connection) or access_token
+        except Exception as e:
+            log_structured(
+                self.logger,
+                "warning",
+                f"Token refresh before deregistration failed, trying the stored token: {e}",
+                provider=provider,
+                task="deregister_user",
+                user_id=str(user_id),
+            )
+        if not access_token:
             return
 
         try:
-            oauth.deregister_user(connection.access_token)
+            oauth.deregister_user(access_token)
             log_structured(
                 self.logger,
                 "info",

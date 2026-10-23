@@ -18,6 +18,7 @@ from app.services.providers.garmin.backfill_state import (
 )
 
 from .archival_task import run_daily_archival
+from .delete_provider_data_task import delete_provider_data
 from .emit_webhook_event_task import emit_webhook_event
 from .fill_missing_resilience_scores_task import fill_missing_resilience_scores
 from .fill_missing_sleep_scores_task import fill_missing_sleep_scores
@@ -35,6 +36,7 @@ from .garmin.backfill_trigger import (
     trigger_backfill_for_type as trigger_garmin_backfill_for_type,
 )
 from .garmin.gc_task import gc_stuck_backfills
+from .garmin.token_refresh_task import refresh_garmin_tokens
 from .notify_hos_task import notify_hos
 from .periodic_sync_task import sync_all_users
 from .process_aws_upload_task import process_aws_upload
@@ -60,6 +62,9 @@ __all__ = [
     "set_garmin_cancel_flag",
     "is_garmin_backfill_cancelled",
     "gc_stuck_backfills",
+    "refresh_garmin_tokens",
+    # Provider data deletion after disconnect
+    "delete_provider_data",
     # Archival
     "run_daily_archival",
     # Sleep score calculation

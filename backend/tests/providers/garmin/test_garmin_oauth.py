@@ -11,8 +11,14 @@ from app.models import User
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import AuthenticationMethod
-from app.schemas.model_crud.credentials import OAuthTokenResponse, ProviderCredentials, ProviderEndpoints
+from app.schemas.model_crud.credentials import (
+    OAuthState,
+    OAuthTokenResponse,
+    ProviderCredentials,
+    ProviderEndpoints,
+)
 from app.services.providers.garmin.oauth import GarminOAuth
+from app.services.providers.templates.base_oauth import OAuthConnectionError
 from tests.factories import UserConnectionFactory, UserFactory
 
 
@@ -117,7 +123,7 @@ class TestGarminOAuth:
         mock_httpx_get: MagicMock,
         garmin_oauth: GarminOAuth,
     ) -> None:
-        """Test fetching Garmin user info handles errors gracefully."""
+        """A failed Garmin user id lookup fails the connection instead of saving it without an id."""
         # Arrange
         token_response = OAuthTokenResponse(
             access_token="test_access_token",
@@ -128,13 +134,49 @@ class TestGarminOAuth:
 
         mock_httpx_get.side_effect = httpx.HTTPError("API Error")
 
-        # Act
-        user_info = garmin_oauth._get_provider_user_info(token_response, "internal_user_id")
+        # Act / Assert
+        with pytest.raises(OAuthConnectionError) as exc_info:
+            garmin_oauth._get_provider_user_info(token_response, "internal_user_id")
+        assert exc_info.value.reason == "provider_user_lookup_failed"
 
-        # Assert - should return None values on error
-        assert user_info["user_id"] is None
-        assert user_info["username"] is None
-        assert user_info["scope"] is None
+    @patch("httpx.get")
+    def test_get_provider_user_info_without_user_id_fails(
+        self,
+        mock_httpx_get: MagicMock,
+        garmin_oauth: GarminOAuth,
+    ) -> None:
+        """A lookup that answers without a userId is treated as a failure too."""
+        token_response = OAuthTokenResponse(access_token="t", token_type="Bearer", expires_in=3600)
+        response = MagicMock()
+        response.json.return_value = {}
+        mock_httpx_get.return_value = response
+
+        with pytest.raises(OAuthConnectionError):
+            garmin_oauth._get_provider_user_info(token_response, "internal_user_id")
+
+    def test_garmin_is_single_owner(self, garmin_oauth: GarminOAuth) -> None:
+        """One Garmin account maps to one OW user: the latest connection wins."""
+        assert garmin_oauth.single_owner_per_account is True
+
+    @patch("app.services.providers.garmin.oauth.GarminOAuth._exchange_token")
+    @patch("httpx.get")
+    def test_handle_callback_does_not_save_connection_without_user_id(
+        self,
+        mock_get: MagicMock,
+        mock_exchange: MagicMock,
+        garmin_oauth: GarminOAuth,
+        db: Session,
+    ) -> None:
+        """When the lookup fails no connection row is written, so no push is silently dropped later."""
+        user = UserFactory()
+        mock_get.side_effect = httpx.HTTPError("down")
+        mock_exchange.return_value = OAuthTokenResponse(access_token="t", token_type="Bearer", expires_in=3600)
+        state = OAuthState(user_id=user.id, provider="garmin")
+
+        with pytest.raises(OAuthConnectionError):
+            garmin_oauth.complete_callback(db, "code", state, "verifier")
+
+        assert UserConnectionRepository().get_by_user_and_provider(db, user.id, "garmin") is None
 
     @patch("httpx.get")
     def test_get_provider_user_info_returns_scope(

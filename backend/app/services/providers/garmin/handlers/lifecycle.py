@@ -2,7 +2,8 @@
 
 Handles webhook events that change the state of a user's Garmin connection:
 - userPermissionsChange: update the OAuth scope stored on the connection
-- deregistrations: mark the connection as revoked
+- deregistrations: mark the connection(s) as revoked and queue deletion of the
+  user's Garmin data (provider_data_deletion)
 """
 
 import logging
@@ -11,6 +12,7 @@ from typing import Any
 from app.database import DbSession
 from app.repositories import UserConnectionRepository
 from app.services.outgoing_webhooks.events import on_connection_revoked
+from app.services.provider_data_deletion import schedule_provider_data_deletion
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
@@ -77,7 +79,11 @@ def process_deregistrations(
     deregistrations_list: list[dict[str, Any]],
     trace_id: str,
 ) -> dict[str, Any]:
-    """Handle deregistration entries — mark connections as revoked."""
+    """Handle deregistration entries — revoke every OW connection to that Garmin account.
+
+    The Garmin user removed our app, so every OW user linked to that Garmin account
+    is cut off, and each one's Garmin data is queued for deletion.
+    """
     results: dict[str, Any] = {"revoked": 0, "errors": []}
 
     if not isinstance(deregistrations_list, list):
@@ -93,8 +99,8 @@ def process_deregistrations(
             results["errors"].append("Missing userId in deregistrations entry")
             continue
 
-        connection = connection_repo.get_by_provider_user_id(db, "garmin", garmin_user_id)
-        if not connection:
+        connections = connection_repo.get_all_by_provider_user_id(db, "garmin", garmin_user_id)
+        if not connections:
             log_structured(
                 logger,
                 "info",
@@ -105,24 +111,26 @@ def process_deregistrations(
             )
             continue
 
-        connection_repo.mark_as_revoked(db, connection)
-        on_connection_revoked(
-            user_id=connection.user_id,
-            provider="garmin",
-            connection_id=connection.id,
-            reason="deregistration",
-            revoked_at=connection.updated_at.isoformat(),
-        )
+        for connection in connections:
+            connection_repo.mark_as_revoked(db, connection)
+            on_connection_revoked(
+                user_id=connection.user_id,
+                provider="garmin",
+                connection_id=connection.id,
+                reason="deregistration",
+                revoked_at=connection.updated_at.isoformat(),
+            )
+            schedule_provider_data_deletion(connection.user_id, "garmin", reason="deregistration")
 
-        log_structured(
-            logger,
-            "info",
-            "Revoked connection via deregistration webhook",
-            provider="garmin",
-            trace_id=trace_id,
-            garmin_user_id=garmin_user_id,
-            user_id=str(connection.user_id),
-        )
-        results["revoked"] += 1
+            log_structured(
+                logger,
+                "info",
+                "Revoked connection via deregistration webhook",
+                provider="garmin",
+                trace_id=trace_id,
+                garmin_user_id=garmin_user_id,
+                user_id=str(connection.user_id),
+            )
+            results["revoked"] += 1
 
     return results
