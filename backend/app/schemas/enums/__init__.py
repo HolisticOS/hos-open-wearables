@@ -15,12 +15,17 @@ from .provider import (
     ProviderName,
 )
 from .series_types import (
+    GPS_STORAGE_SERIES,
+    SCALED_GPS_SERIES,
     SERIES_TYPE_DEFINITIONS,
     SERIES_TYPE_ID_BY_ENUM,
     SeriesType,
     get_series_type_from_id,
     get_series_type_id,
     get_series_type_unit,
+    public_series_type,
+    to_public_value,
+    to_storage_value,
 )
 from .workout_types import (
     WORKOUTS_WITH_PACE,
@@ -41,6 +46,11 @@ __all__ = [
     "get_series_type_id",
     "get_series_type_from_id",
     "get_series_type_unit",
+    "GPS_STORAGE_SERIES",
+    "SCALED_GPS_SERIES",
+    "public_series_type",
+    "to_public_value",
+    "to_storage_value",
     "WorkoutType",
     "WORKOUTS_WITH_PACE",
     "ProviderName",

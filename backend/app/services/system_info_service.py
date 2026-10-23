@@ -5,7 +5,7 @@ from logging import Logger, getLogger
 from uuid import UUID
 
 from app.database import DbSession
-from app.schemas.enums import get_series_type_from_id
+from app.schemas.enums import SCALED_GPS_SERIES, get_series_type_from_id
 from app.schemas.enums.series_types import SERIES_TYPE_ENUM_BY_ID
 from app.schemas.responses.dashboard import ProviderDataCount, UserDataSummaryResponse
 from app.schemas.responses.upload import (
@@ -19,6 +19,8 @@ from app.services.event_record_service import EventRecordService, event_record_s
 from app.services.timeseries_service import TimeSeriesService, timeseries_service
 from app.services.user_connection_service import UserConnectionService, user_connection_service
 from app.services.user_service import UserService, user_service
+
+SCALED_GPS_CODES: dict[str, str] = {stored.value: public.value for stored, public in SCALED_GPS_SERIES.items()}
 
 
 class SystemInfoService:
@@ -160,7 +162,9 @@ class SystemInfoService:
         series_type_totals: dict[str, int] = defaultdict(int)
         workout_type_totals: dict[str, int] = defaultdict(int)
 
-        for provider, code, count in series_rows:
+        for provider, stored_code, count in series_rows:
+            # Scaled GPS storage types are counted under latitude/longitude.
+            code = SCALED_GPS_CODES.get(stored_code, stored_code)
             provider_series[provider][code] += count
             provider_data_points[provider] += count
             series_type_totals[code] += count

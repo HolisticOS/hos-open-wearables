@@ -18,7 +18,14 @@ from app.repositories import (
     UserConnectionRepository,
 )
 from app.repositories.data_point_series_repository import DataPointSeriesRepository
-from app.schemas.enums import AggregationMethod, HealthScoreCategory, ProviderName, SeriesType, daily_total_flag
+from app.schemas.enums import (
+    AggregationMethod,
+    HealthScoreCategory,
+    ProviderName,
+    SeriesType,
+    daily_total_flag,
+    to_storage_value,
+)
 from app.schemas.enums.aggregation_method import get_aggregation_method
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -1061,7 +1068,7 @@ class Garmin247Data(Base247DataTemplate):
                         source=self.provider_name,
                         recorded_at=recorded_at,
                         zone_offset=zone_offset,
-                        value=Decimal(str(value)),
+                        value=to_storage_value(series_type, value),
                         series_type=series_type,
                     )
                 )

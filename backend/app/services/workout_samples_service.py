@@ -9,7 +9,15 @@ from app.database import DbSession
 from app.models import DataPointSeries, EventRecord, WorkoutDetails
 from app.repositories import DataPointSeriesRepository, DataSourceRepository, EventRecordRepository
 from app.repositories.data_point_series_repository import WorkoutWindow
-from app.schemas.enums import SeriesType, get_series_type_from_id, get_series_type_id, get_series_type_unit
+from app.schemas.enums import (
+    GPS_STORAGE_SERIES,
+    SCALED_GPS_SERIES,
+    SeriesType,
+    get_series_type_from_id,
+    get_series_type_id,
+    get_series_type_unit,
+    to_public_value,
+)
 from app.schemas.responses.activity import (
     HeartRateZoneRead,
     PowerZoneRead,
@@ -67,7 +75,8 @@ class WorkoutSamplesService:
 
         requested = [t for t in WORKOUT_SAMPLE_TYPES if t in (types or WORKOUT_SAMPLE_TYPES)]
         numeric_ids = [get_series_type_id(t) for t in requested if t not in ROUTE_TYPES]
-        route_ids = [get_series_type_id(t) for t in requested if t in ROUTE_TYPES]
+        # Route rows: scaled storage types (current) and the legacy degree types (older rows).
+        route_ids = [get_series_type_id(st) for t in requested if t in ROUTE_TYPES for st in (GPS_STORAGE_SERIES[t], t)]
         all_ids = numeric_ids + route_ids
 
         window = WorkoutWindow(
@@ -101,7 +110,7 @@ class WorkoutSamplesService:
                 entry.points.append((ts, round(value, 3)))
 
         route: list[tuple[datetime, float, float]] = []
-        if len(route_ids) == 2:
+        if len(route_ids) == 4:
             route = self._downsample_route(
                 self.data_point_repo.get_raw_points(db_session, window, route_ids),
                 record.start_datetime,
@@ -128,12 +137,19 @@ class WorkoutSamplesService:
         end: datetime,
         max_points: int,
     ) -> list[tuple[datetime, float, float]]:
-        """Pair latitude/longitude by timestamp and keep the recorded point nearest each bucket centre."""
-        lat_id = get_series_type_id(SeriesType.latitude)
+        """Pair latitude/longitude by timestamp and keep the recorded point nearest each bucket centre.
+
+        Scaled rows win: when the window has any, legacy degree rows are ignored.
+        """
+        scaled_ids = {get_series_type_id(st) for st in SCALED_GPS_SERIES}
+        if any(type_id in scaled_ids for type_id, _, _ in rows):
+            rows = [row for row in rows if row[0] in scaled_ids]
         lats: dict[datetime, float] = {}
         lons: dict[datetime, float] = {}
         for type_id, ts, value in rows:
-            (lats if type_id == lat_id else lons)[ts] = value
+            stored = get_series_type_from_id(type_id)
+            target = lats if stored in (SeriesType.latitude, SeriesType.latitude_e4) else lons
+            target[ts] = round(to_public_value(stored, value), 7)
         points = sorted((ts, lat, lons[ts]) for ts, lat in lats.items() if ts in lons)
         if len(points) <= max_points:
             return points

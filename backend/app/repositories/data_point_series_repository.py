@@ -14,15 +14,17 @@ from sqlalchemy import (
     asc,
     case,
     cast,
+    exists,
     extract,
     func,
     literal_column,
+    or_,
     text,
     tuple_,
 )
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError as SQLAIntegrityError
-from sqlalchemy.orm import Query
+from sqlalchemy.orm import Query, aliased
 
 from app.database import DbSession
 from app.models import DataPointSeries, DataSource, DeviceTypePriority, ProviderPriority
@@ -30,6 +32,7 @@ from app.models.series_type_definition import SeriesTypeDefinition
 from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.repositories import CrudRepository
 from app.schemas.enums import (
+    SCALED_GPS_SERIES,
     ProviderName,
     SeriesType,
     get_series_type_from_id,
@@ -353,6 +356,23 @@ class DataPointSeriesRepository(
         if types:
             type_ids = [get_series_type_id(t) for t in types]
             query = query.filter(self.model.series_type_definition_id.in_(type_ids))
+
+        # A legacy latitude/longitude row is hidden when the scaled row for the same source and
+        # time exists (the same sample re-ingested after the switch to scaled GPS storage).
+        scaled = aliased(self.model)
+        for stored, public in SCALED_GPS_SERIES.items():
+            if types and public not in types:
+                continue
+            query = query.filter(
+                or_(
+                    self.model.series_type_definition_id != get_series_type_id(public),
+                    ~exists().where(
+                        scaled.data_source_id == self.model.data_source_id,
+                        scaled.recorded_at == self.model.recorded_at,
+                        scaled.series_type_definition_id == get_series_type_id(stored),
+                    ),
+                )
+            )
 
         if params.device_model:
             query = query.filter(DataSource.device_model == params.device_model)

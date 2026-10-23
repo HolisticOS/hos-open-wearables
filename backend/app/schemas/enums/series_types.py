@@ -9,6 +9,7 @@ This module contains:
 IMPORTANT: Never change existing IDs - only add new ones. IDs are persisted in the database.
 """
 
+from decimal import Decimal
 from enum import Enum
 
 
@@ -148,6 +149,10 @@ class SeriesType(str, Enum):
     latitude = "latitude"
     longitude = "longitude"
     air_temperature = "air_temperature"
+    # GPS coordinates stored scaled by GPS_STORAGE_SCALE (see below); readers return degrees
+    # under latitude/longitude. Internal storage types, never returned to API consumers.
+    latitude_e4 = "latitude_e4"
+    longitude_e4 = "longitude_e4"
 
     # =========================================================================
     # GARMIN-SPECIFIC METRICS (IDs 220-239)
@@ -294,6 +299,8 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     (210, SeriesType.latitude, "degrees"),
     (211, SeriesType.longitude, "degrees"),
     (212, SeriesType.air_temperature, "celsius"),
+    (213, SeriesType.latitude_e4, "deg_e4"),
+    (214, SeriesType.longitude_e4, "deg_e4"),
     # -------------------------------------------------------------------------
     # GARMIN-SPECIFIC METRICS (IDs 220-239)
     # -------------------------------------------------------------------------
@@ -342,6 +349,41 @@ def get_series_type_from_id(series_type_id: int) -> SeriesType:
 def get_series_type_unit(series_type: SeriesType) -> str:
     """Get the unit string for a series type."""
     return SERIES_TYPE_UNIT_BY_ENUM[series_type]
+
+
+# =============================================================================
+# SCALED GPS STORAGE
+# =============================================================================
+# data_point_series.value is NUMERIC(10,3), which would round degrees to ~110 m.
+# Coordinates are written x10,000 to the *_e4 types instead (max 1,800,000.000 fits),
+# keeping 1e-7 degree precision. Rows written before this under latitude/longitude
+# stay valid and are read as plain degrees.
+
+GPS_STORAGE_SCALE = 10_000
+
+# storage type -> public type
+SCALED_GPS_SERIES: dict[SeriesType, SeriesType] = {
+    SeriesType.latitude_e4: SeriesType.latitude,
+    SeriesType.longitude_e4: SeriesType.longitude,
+}
+# public type -> storage type
+GPS_STORAGE_SERIES: dict[SeriesType, SeriesType] = {public: stored for stored, public in SCALED_GPS_SERIES.items()}
+
+
+def public_series_type(series_type: SeriesType) -> SeriesType:
+    """The type API consumers see for a stored series type (latitude_e4 -> latitude)."""
+    return SCALED_GPS_SERIES.get(series_type, series_type)
+
+
+def to_public_value(series_type: SeriesType, value: float) -> float:
+    """Value as API consumers see it: scaled GPS storage converted back to degrees."""
+    return value / GPS_STORAGE_SCALE if series_type in SCALED_GPS_SERIES else value
+
+
+def to_storage_value(series_type: SeriesType, value: float | Decimal) -> Decimal:
+    """Value as written to data_point_series for ``series_type`` (a storage type)."""
+    decimal_value = Decimal(str(value))
+    return decimal_value * GPS_STORAGE_SCALE if series_type in SCALED_GPS_SERIES else decimal_value
 
 
 # =============================================================================

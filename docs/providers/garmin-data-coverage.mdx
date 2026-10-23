@@ -40,10 +40,15 @@ overwrites the value. Health scores are keyed by `(user, provider, category, rec
 later push with the same key replaces the value, qualifier, components and zone offset (Garmin re-sends
 revised summaries for the same day).
 
-<Warning>
-Time series values are stored as `NUMERIC(10,3)`, so latitude and longitude keep three decimals
-(roughly 110 m north-south). Routes drawn from these points are coarse.
-</Warning>
+**GPS precision.** Time series values are stored as `NUMERIC(10,3)`. To keep GPS precise, coordinates are
+written multiplied by 10,000 to two internal series types, `latitude_e4` and `longitude_e4` (unit
+`deg_e4`). Longitude ±180° becomes at most 1,800,000.000, which fits, and three decimals of the scaled
+value are 1e-7 degree (about 1 cm). Every reader converts back: `/timeseries`, the workout samples
+endpoint, outgoing webhook payloads and the per-user data summary return plain degrees under `latitude`
+and `longitude`. The internal types and scaled values are never returned. Rows written before this
+change under `latitude`/`longitude` (rounded to three decimals) stay readable; when a scaled row exists
+for the same source and time, the older row is hidden, and the samples endpoint uses only scaled rows
+whenever the workout window has any.
 
 **Device model.** Workouts carry the Garmin `deviceName` as `source.device`. Wellness summaries in the
 code paths below carry no device field, so their samples, sleep sessions and scores have
@@ -232,8 +237,8 @@ With `INGEST_WORKOUT_SAMPLES=true`, each entry in `samples[]` becomes time serie
 | `stepsPerMinute` | `cadence` |
 | `powerInWatts` | `power` |
 | `elevationInMeters` | `elevation` |
-| `latitudeInDegree` | `latitude` |
-| `longitudeInDegree` | `longitude` |
+| `latitudeInDegree` | `latitude` (stored scaled, see GPS precision) |
+| `longitudeInDegree` | `longitude` (stored scaled, see GPS precision) |
 | `airTemperatureCelcius` | `air_temperature` |
 
 Other sample fields and a `laps` list are not captured; their payload shape is not evidenced in the

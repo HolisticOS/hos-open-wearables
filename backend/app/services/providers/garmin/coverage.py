@@ -1,4 +1,4 @@
-from app.schemas.enums import SeriesType
+from app.schemas.enums import SeriesType, public_series_type
 from app.schemas.enums.health_score_category import HealthScoreCategory
 
 # Timeseries mappings (handler key → SeriesType) consumed directly by data_247.py.
@@ -11,8 +11,9 @@ ACTIVITY_SAMPLE_SERIES: list[tuple[str, SeriesType]] = [
     ("stepsPerMinute", SeriesType.cadence),
     ("powerInWatts", SeriesType.power),
     ("elevationInMeters", SeriesType.elevation),
-    ("latitudeInDegree", SeriesType.latitude),
-    ("longitudeInDegree", SeriesType.longitude),
+    # GPS goes to the scaled storage types; readers return degrees as latitude/longitude.
+    ("latitudeInDegree", SeriesType.latitude_e4),
+    ("longitudeInDegree", SeriesType.longitude_e4),
     ("airTemperatureCelcius", SeriesType.air_temperature),
 ]
 
@@ -41,7 +42,7 @@ EPOCHS_SERIES: dict[str, SeriesType] = {
 
 TIMESERIES: frozenset[SeriesType] = frozenset(
     {
-        *(st for _, st in ACTIVITY_SAMPLE_SERIES),  # /wellness-api/rest/activities (activityDetails + FIT)
+        *(public_series_type(st) for _, st in ACTIVITY_SAMPLE_SERIES),  # activityDetails + FIT
         *(st for _, st in DAILIES_SERIES),  # /wellness-api/rest/dailies
         *EPOCHS_SERIES.values(),  # /wellness-api/rest/epochs
         SeriesType.weight,  # /wellness-api/rest/bodyComps

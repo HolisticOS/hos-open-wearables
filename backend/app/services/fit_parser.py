@@ -11,7 +11,7 @@ from uuid import UUID, uuid4
 
 import fitdecode
 
-from app.schemas.enums.series_types import SeriesType
+from app.schemas.enums.series_types import GPS_STORAGE_SCALE, SeriesType
 from app.schemas.model_crud.activities.data_point_series import TimeSeriesSampleCreate
 from app.schemas.model_crud.activities.zones import HRZone, HRZones, PowerZone, PowerZones
 
@@ -53,8 +53,9 @@ _RECORD_FIELD_MAP: tuple[_FieldMapping, ...] = (
     # FIT stores step_length in mm, SeriesType unit is cm
     _FieldMapping(("step_length",), SeriesType.running_stride_length, _scale(0.1)),
     _FieldMapping(("enhanced_altitude", "altitude"), SeriesType.elevation),
-    _FieldMapping(("position_lat",), SeriesType.latitude, _scale(_SEMICIRCLES_TO_DEGREES)),
-    _FieldMapping(("position_long",), SeriesType.longitude, _scale(_SEMICIRCLES_TO_DEGREES)),
+    # GPS is stored scaled (degrees x GPS_STORAGE_SCALE) so NUMERIC(10,3) keeps 1e-7 degree precision.
+    _FieldMapping(("position_lat",), SeriesType.latitude_e4, _scale(_SEMICIRCLES_TO_DEGREES * GPS_STORAGE_SCALE)),
+    _FieldMapping(("position_long",), SeriesType.longitude_e4, _scale(_SEMICIRCLES_TO_DEGREES * GPS_STORAGE_SCALE)),
     _FieldMapping(("temperature",), SeriesType.air_temperature),
     # fitdecode auto-applies scale=100 for these fields; value arrives already in percent
     _FieldMapping(("vertical_ratio",), SeriesType.running_vertical_ratio),

@@ -12,9 +12,12 @@ from app.models import DataPointSeries
 from app.repositories import DataPointSeriesRepository
 from app.repositories.data_point_series_repository import WriteCounts
 from app.schemas.enums import (
+    GPS_STORAGE_SERIES,
     SeriesType,
     get_series_type_from_id,
     get_series_type_unit,
+    public_series_type,
+    to_public_value,
 )
 from app.schemas.model_crud.activities import (
     HeartRateSampleCreate,
@@ -80,7 +83,8 @@ class TimeSeriesService(
         try:
             groups: dict[tuple[UUID, str, str], list[Any]] = defaultdict(list)
             for s in samples:
-                key = (s.user_id, s.provider or s.source or "unknown", s.series_type.value)
+                # Scaled GPS storage types go out as plain latitude/longitude degrees.
+                key = (s.user_id, s.provider or s.source or "unknown", public_series_type(s.series_type).value)
                 groups[key].append(s)
             for (user_id, provider, series_type_value), group_samples in groups.items():
                 sorted_samples = sorted(group_samples, key=lambda s: s.recorded_at)
@@ -91,7 +95,7 @@ class TimeSeriesService(
                         "timestamp": s.recorded_at.isoformat(),
                         "zone_offset": s.zone_offset,
                         "type": series_type_value,
-                        "value": float(s.value),
+                        "value": to_public_value(s.series_type, float(s.value)),
                         "unit": unit,
                         "source": {"provider": provider, "device": s.device_model},
                         "is_daily_total": s.is_daily_total,
@@ -143,7 +147,14 @@ class TimeSeriesService(
         types: list[SeriesType],
         params: TimeSeriesQueryParams,
     ) -> PaginatedResponse[TimeSeriesSample]:
-        samples, total_count = self.crud.get_samples(db_session, params, types, user_id)
+        # latitude/longitude cover both the legacy rows and the scaled storage rows.
+        query_types: list[SeriesType] = []
+        for t in types:
+            public = public_series_type(t)
+            for candidate in (public, GPS_STORAGE_SERIES.get(public)):
+                if candidate is not None and candidate not in query_types:
+                    query_types.append(candidate)
+        samples, total_count = self.crud.get_samples(db_session, params, query_types, user_id)
 
         limit = params.limit or 50
         has_more = len(samples) > limit
@@ -182,7 +193,8 @@ class TimeSeriesService(
         # Map to response format
         data = []
         for sample, data_source in samples:
-            series_type = get_series_type_from_id(sample.series_type_definition_id)
+            stored_type = get_series_type_from_id(sample.series_type_definition_id)
+            series_type = public_series_type(stored_type)
             unit = get_series_type_unit(series_type)
 
             # Build source from data source info if available
@@ -197,7 +209,7 @@ class TimeSeriesService(
                 timestamp=sample.recorded_at,
                 zone_offset=sample.zone_offset,
                 type=series_type,
-                value=float(sample.value),
+                value=to_public_value(stored_type, float(sample.value)),
                 unit=unit,
                 source=source,
                 is_daily_total=sample.is_daily_total,

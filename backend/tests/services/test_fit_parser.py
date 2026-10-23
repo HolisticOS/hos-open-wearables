@@ -39,8 +39,10 @@ class TestRunning:
         assert SeriesType.power in types
         assert SeriesType.running_vertical_oscillation in types
         assert SeriesType.running_ground_contact_time in types
-        assert SeriesType.latitude in types
-        assert SeriesType.longitude in types
+        # GPS is written to the scaled storage types (degrees x 10,000)
+        assert SeriesType.latitude_e4 in types
+        assert SeriesType.longitude_e4 in types
+        assert SeriesType.latitude not in types
         assert SeriesType.elevation in types
         assert SeriesType.air_temperature in types
         assert SeriesType.running_vertical_ratio in types
@@ -72,11 +74,15 @@ class TestRunning:
         assert s.recorded_at is not None
         assert s.recorded_at.tzinfo is not None
 
-    def test_gps_values_in_degree_range(self, running: FitParseResult) -> None:
-        lats = [s.value for s in running.samples if s.series_type == SeriesType.latitude]
-        lons = [s.value for s in running.samples if s.series_type == SeriesType.longitude]
-        assert all(Decimal(-90) <= v <= Decimal(90) for v in lats)
-        assert all(Decimal(-180) <= v <= Decimal(180) for v in lons)
+    def test_gps_values_scaled_degree_range(self, running: FitParseResult) -> None:
+        lats = [s.value for s in running.samples if s.series_type == SeriesType.latitude_e4]
+        lons = [s.value for s in running.samples if s.series_type == SeriesType.longitude_e4]
+        assert lats
+        assert lons
+        assert all(Decimal(-900_000) <= v <= Decimal(900_000) for v in lats)
+        assert all(Decimal(-1_800_000) <= v <= Decimal(1_800_000) for v in lons)
+        # synthetic 50°N, stored x10,000 and within 1e-6 degree after scaling back
+        assert all(abs(v / 10_000 - Decimal(50)) < Decimal("0.000001") for v in lats)
 
     def test_elevation_in_meters(self, running: FitParseResult) -> None:
         vals = [s.value for s in running.samples if s.series_type == SeriesType.elevation]
