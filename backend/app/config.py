@@ -208,6 +208,17 @@ class Settings(BaseSettings):
     # Bearer token for the Svix API.  If unset, auto-generated from svix_jwt_secret at startup.
     svix_auth_token: SecretStr | None = None
 
+    # HOS DATA-ARRIVED NOTIFY
+    # When set, every ingest that saves data for a user tells the HOS backend
+    # (POST {url}, X-Service-Key header) so it can refresh that user's snapshots,
+    # events and challenges without waiting for the app to open. Unset = off.
+    hos_notify_url: str | None = None
+    hos_notify_service_key: SecretStr | None = None
+    # The first data for a user is sent at once. More data for that user inside
+    # this many seconds (Garmin sends dailies, epochs, sleep... as separate
+    # webhooks) is folded into one follow-up notify at the end of the window.
+    hos_notify_window_seconds: int = 10
+
     @model_validator(mode="after")
     def derive_svix_jwt_secret(self) -> "Settings":
         if self.svix_jwt_secret is None or self.svix_jwt_secret.get_secret_value() == "":

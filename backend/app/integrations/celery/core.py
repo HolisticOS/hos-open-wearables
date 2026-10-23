@@ -99,6 +99,8 @@ def create_celery() -> Celery:
         },
         task_routes={
             "app.integrations.celery.tasks.process_sdk_upload_task.process_sdk_upload": {"queue": "sdk_sync"},
+            # Tiny and latency-sensitive: keep it off "default", where long periodic syncs run.
+            "app.integrations.celery.tasks.notify_hos_task.notify_hos": {"queue": "webhook_sync"},
         },
     )
 

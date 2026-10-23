@@ -35,6 +35,7 @@ from .garmin.backfill_trigger import (
     trigger_backfill_for_type as trigger_garmin_backfill_for_type,
 )
 from .garmin.gc_task import gc_stuck_backfills
+from .notify_hos_task import notify_hos
 from .periodic_sync_task import sync_all_users
 from .process_aws_upload_task import process_aws_upload
 from .process_sdk_upload_task import process_sdk_upload
@@ -79,4 +80,5 @@ __all__ = [
     "renew_oura_webhooks",
     # Outgoing webhooks
     "emit_webhook_event",
+    "notify_hos",
 ]

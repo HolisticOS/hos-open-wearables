@@ -17,6 +17,7 @@ from fastapi import HTTPException
 from app.database import SessionLocal
 from app.schemas.sync_status import SyncStatus
 from app.services import sync_status_service
+from app.services.hos_notify import schedule_hos_notify
 from app.services.providers.factory import ProviderFactory
 from app.utils.structured_logging import log_structured
 
@@ -129,6 +130,22 @@ def _emit_webhook_sync_status(provider_name: str, result: Any) -> None:
         logger.debug("Failed to emit webhook sync status: %s", exc, exc_info=True)
 
 
+def _saved_user_ids(result: Any) -> list[str]:
+    """Users whose data this delivery actually persisted.
+
+    Garmin batches many users per push and lists them in ``synced_user_ids``;
+    the single-user providers report ``user_id`` with a saved status.
+    """
+    if not isinstance(result, dict):
+        return []
+    if "synced_user_ids" in result:
+        return [str(u) for u in result["synced_user_ids"]]
+    status_str = str(result.get("status") or "").lower()
+    if result.get("user_id") and status_str in _SAVED_STATUSES and (_extract_item_count(result) or 0) > 0:
+        return [str(result["user_id"])]
+    return []
+
+
 @shared_task(
     bind=True,
     acks_late=True,
@@ -156,6 +173,7 @@ def process_webhook_push(
         with SessionLocal() as db:
             result = handler.process_payload(db, payload, request_trace_id)
         _emit_webhook_sync_status(provider_name, result)
+        schedule_hos_notify(_saved_user_ids(result), provider_name)
         return result
     except ValueError as exc:
         # Configuration error (unknown provider, missing handler) — retrying won't help.

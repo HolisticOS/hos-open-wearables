@@ -38,6 +38,14 @@ class TestGarminWebhookAuth:
         assert response.status_code == 200
         assert response.json() == {"status": "accepted"}
 
+    def test_other_apps_client_id_returns_401(self, client: TestClient, db: Session) -> None:
+        """With our client id configured, a header naming another app is rejected."""
+        with patch("app.services.providers.garmin.webhook_handler.settings.garmin_client_id", "our-client-id"):
+            rejected = client.post(PUSH_ENDPOINT, headers={"garmin-client-id": "someone-else"}, json={})
+            accepted = client.post(PUSH_ENDPOINT, headers={"garmin-client-id": "our-client-id"}, json={})
+        assert rejected.status_code == 401
+        assert accepted.status_code == 200
+
     def test_invalid_json_returns_400(self, client: TestClient, db: Session) -> None:
         """Malformed JSON body returns 400."""
         response = client.post(

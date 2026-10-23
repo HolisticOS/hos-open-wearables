@@ -10,6 +10,7 @@ ignored and the endpoint still returns 200 so Garmin stops retrying.
 """
 
 import contextlib
+import hmac
 import json
 import logging
 from typing import Any
@@ -18,6 +19,7 @@ from uuid import UUID, uuid4
 from celery import current_app as celery_app
 from fastapi import HTTPException, Request
 
+from app.config import settings
 from app.database import DbSession
 from app.repositories import UserConnectionRepository
 from app.services.providers.garmin.backfill_state import (
@@ -99,6 +101,18 @@ class GarminWebhookHandler(BaseWebhookHandler):
                 logger,
                 "warning",
                 "Missing garmin-client-id header",
+                provider="garmin",
+                action="webhook_signature_invalid",
+            )
+            return False
+        # Garmin does not sign bodies, so the client id is all there is to check.
+        # Presence alone would let anyone post data for any Garmin user.
+        expected = settings.garmin_client_id
+        if expected and not hmac.compare_digest(client_id, expected):
+            log_structured(
+                logger,
+                "warning",
+                "garmin-client-id header does not match this app",
                 provider="garmin",
                 action="webhook_signature_invalid",
             )
@@ -187,6 +201,7 @@ class GarminWebhookHandler(BaseWebhookHandler):
             "activities": act_result["details"],
             "wellness": well_result,
             "backfill_chained": [],
+            "synced_user_ids": sorted(str(uid) for uid in synced_user_ids),
         }
 
         self._process_lifecycle_events(db, payload, response, trace_id)

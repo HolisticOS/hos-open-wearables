@@ -15,6 +15,7 @@ from app.services.apple.healthkit.import_service import (
 from app.services.apple.healthkit.import_service import (
     import_service as sdk_import_service,
 )
+from app.services.hos_notify import schedule_hos_notify
 from app.services.sync_status_service import completed, failed, started
 from app.utils.structured_logging import log_structured
 
@@ -146,6 +147,8 @@ def process_sdk_upload(
         items_total = records_saved + workouts_saved + sleep_saved
 
         if isinstance(status_code, int) and 200 <= status_code < 300:
+            if items_total > 0:
+                schedule_hos_notify([user_id], provider)
             completed(
                 user_uuid,
                 provider,
