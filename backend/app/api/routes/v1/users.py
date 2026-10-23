@@ -17,12 +17,19 @@ router = APIRouter()
 
 
 @router.get("/users", response_model=OldPaginatedResponse[UserRead])
-async def list_users(
+def list_users(
     db: DbSession,
     _api_key: ApiKeyDep,
     query_params: Annotated[UserQueryParams, Query()],
 ):
-    """List users with pagination, sorting, and search."""
+    """List users with pagination, sorting, and search.
+
+    A plain def on purpose: the query is blocking, so FastAPI must run it in the
+    threadpool. As an async def it ran on the event loop, and while the DB pool
+    was full it blocked there waiting for a connection, which stopped the loop
+    from finishing the requests that would have returned one. The whole server
+    hung, / included, until restarted.
+    """
     return user_service.get_users_paginated(db, query_params)
 
 
