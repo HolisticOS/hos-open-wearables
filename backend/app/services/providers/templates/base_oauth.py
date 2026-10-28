@@ -169,8 +169,15 @@ class BaseOAuthTemplate(ABC):
 
         return oauth_state
 
-    def refresh_access_token(self, db: DbSession, user_id: UUID, refresh_token: str) -> OAuthTokenResponse:
-        """Refreshes the access token using the refresh token."""
+    def refresh_access_token(
+        self, db: DbSession, user_id: UUID, refresh_token: str, *, revoke_on_reject: bool = True
+    ) -> OAuthTokenResponse:
+        """Refreshes the access token using the refresh token.
+
+        A 400/401 from the provider revokes the connection, unless revoke_on_reject is False:
+        a push-only connection still receives its data without a token, so a background
+        refresh that fails must not cut it off.
+        """
         data, headers = self._prepare_refresh_request(refresh_token)
 
         try:
@@ -216,7 +223,8 @@ class BaseOAuthTemplate(ABC):
             )
             # 400/401 = refresh token is dead so revoke + notify
             if e.response.status_code in (HTTP_400_BAD_REQUEST, HTTP_401_UNAUTHORIZED):
-                self._revoke_connection(db, user_id, reason="refresh_failed")
+                if revoke_on_reject:
+                    self._revoke_connection(db, user_id, reason="refresh_failed")
                 raise HTTPException(
                     status_code=HTTP_401_UNAUTHORIZED,
                     detail=f"Refresh token rejected for {self.provider_name}; reconnection required",

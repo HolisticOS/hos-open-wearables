@@ -6,8 +6,11 @@ deregistration (on disconnect or user deletion) is impossible. Once a day this
 task refreshes every active Garmin connection whose access token has expired
 or will expire before the next run, which also rotates the refresh token.
 
-A refresh token that is already dead is rejected by Garmin; the refresh helper
-then revokes that connection, so it drops out of later runs.
+A rejected refresh is logged and the connection stays active. Garmin keeps
+pushing data to a connection whatever its tokens, so revoking it here dropped
+every push until the member reconnected (2026-10-27: a 401 on each nightly run
+revoked the link and the day's strength session was discarded). The member's
+reconnect, or Garmin's own deregistration push, is what ends a connection.
 """
 
 from datetime import timedelta
@@ -52,7 +55,7 @@ def refresh_garmin_tokens() -> dict[str, Any]:
             if not refresh_token:
                 continue
             try:
-                oauth.refresh_access_token(db, connection.user_id, refresh_token)
+                oauth.refresh_access_token(db, connection.user_id, refresh_token, revoke_on_reject=False)
                 refreshed += 1
             except Exception as e:
                 db.rollback()

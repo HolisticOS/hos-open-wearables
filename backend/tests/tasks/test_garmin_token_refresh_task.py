@@ -74,13 +74,16 @@ class TestRefreshGarminTokens:
         assert result == {"refreshed": 0, "failed": 0, "candidates": 0}
         post.assert_not_called()
 
-    def test_dead_refresh_token_revokes_and_continues(self, task_db: Session) -> None:
+    @pytest.mark.parametrize("status_code", [400, 401])
+    def test_rejected_refresh_keeps_the_connection_and_continues(self, task_db: Session, status_code: int) -> None:
         rejected = MagicMock()
         rejected.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "rejected", request=MagicMock(), response=MagicMock(status_code=400, text="invalid_grant")
+            "rejected", request=MagicMock(), response=MagicMock(status_code=status_code, text="rejected")
         )
         dead = UserConnectionFactory(provider="garmin", refresh_token="dead", token_expires_at=_now() - timedelta(1))
         alive = UserConnectionFactory(provider="garmin", refresh_token="ok", token_expires_at=_now() - timedelta(1))
+        # Stored rows, as in production: the task rolls back a failed refresh.
+        task_db.commit()
 
         def respond(url: str, data: dict, **_: object) -> MagicMock:
             return rejected if data["refresh_token"] == "dead" else _token_response("a", "n")
@@ -90,7 +93,9 @@ class TestRefreshGarminTokens:
 
         assert result == {"refreshed": 1, "failed": 1, "candidates": 2}
         task_db.expire_all()
-        assert task_db.get(UserConnection, dead.id).status == ConnectionStatus.REVOKED
+        # Garmin still pushes to it, so it stays active rather than dropping every push.
+        assert task_db.get(UserConnection, dead.id).status == ConnectionStatus.ACTIVE
+        assert task_db.get(UserConnection, dead.id).refresh_token == "dead"
         assert task_db.get(UserConnection, alive.id).refresh_token == "n"
 
 
