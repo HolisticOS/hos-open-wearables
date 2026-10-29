@@ -24,6 +24,7 @@ from app.schemas.responses.activity import (
     WorkoutLap,
     WorkoutSamples,
     WorkoutSampleSeries,
+    WorkoutSet,
 )
 from app.schemas.utils import SourceMetadata
 
@@ -127,6 +128,7 @@ class WorkoutSamplesService:
             series=series,
             route=route,
             laps=self._laps(details.segments if details else None),
+            sets=self._sets(details.segments if details else None),
             zones=self._zones(details),
         )
 
@@ -178,6 +180,14 @@ class WorkoutSamplesService:
                 lap["end_time"] = datetime.fromisoformat(start) + timedelta(seconds=duration)
             laps.append(WorkoutLap(**lap))
         return laps
+
+    @staticmethod
+    def _sets(segments: list[dict[str, Any]] | None) -> list[WorkoutSet]:
+        return [
+            WorkoutSet(**{"duration_seconds" if k == "elapsed_seconds" else k: v for k, v in s.items() if k != "kind"})
+            for s in segments or []
+            if s.get("kind") == "set"
+        ]
 
     @staticmethod
     def _zones(details: WorkoutDetails | None) -> dict[str, list[HeartRateZoneRead] | list[PowerZoneRead]]:

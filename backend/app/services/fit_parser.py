@@ -122,6 +122,12 @@ def parse_fit_file(
                     result.hr_zones = _parse_hr_zones(frame)
                     result.power_zones = _parse_power_zones(frame)
 
+            elif frame.name == "set":
+                strength_set = _extract_set(frame, _seg_counters.setdefault("set", 0))
+                _seg_counters["set"] += 1
+                if strength_set is not None:
+                    result.segments.append(strength_set)
+
             elif frame.name in _SEGMENT_KINDS:
                 numeric, enums = _SEGMENT_KINDS[frame.name]
                 idx = _seg_counters[frame.name]
@@ -237,6 +243,39 @@ def _extract_segment(
         v = _field_val(frame, fit_name)
         if v is not None:
             seg[out_name] = str(v)
+    return {k: v for k, v in seg.items() if v is not None}
+
+
+def _known(v: Any) -> str | None:
+    """First named value of a FIT enum field (scalar or array). Garmin writes
+    65534 / "unknown" when the watch could not tell the exercise."""
+    values = v if isinstance(v, (list, tuple)) else (v,)
+    for value in values:
+        if value is None or value in (65534, 65535, "unknown"):
+            continue
+        return str(value)
+    return None
+
+
+def _extract_set(frame: fitdecode.FitDataMessage, index: int) -> dict | None:
+    """One strength set (FIT `set` message, written for Strength activities).
+
+    Stored as a segment of kind "set", beside laps, so it needs no column of its
+    own. Rest periods are kept out: only work sets say anything about muscles.
+    """
+    set_type = _field_val(frame, "set_type")
+    if set_type is not None and str(set_type) != "active" and set_type != 1:
+        return None
+    seg: dict = {
+        "kind": "set",
+        "index": index,
+        "start_time": _iso(_field_val(frame, "start_time")),
+        "elapsed_seconds": _r2(_field_val(frame, "duration")),
+        "exercise_category": _known(_field_val(frame, "category")) or "unknown",
+        "exercise_subtype": _known(_field_val(frame, "category_subtype")),
+        "repetitions": _field_val(frame, "repetitions"),
+        "weight_kg": _r2(_field_val(frame, "weight")),
+    }
     return {k: v for k, v in seg.items() if v is not None}
 
 

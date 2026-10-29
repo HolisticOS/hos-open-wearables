@@ -16,6 +16,7 @@ from .events import (
     WorkoutLap,
     WorkoutSamples,
     WorkoutSampleSeries,
+    WorkoutSet,
 )
 from .resilience import (
     DailyHrvScore,
@@ -50,6 +51,7 @@ __all__ = [
     "WorkoutSamples",
     "WorkoutSampleSeries",
     "WorkoutLap",
+    "WorkoutSet",
     "HeartRateZoneRead",
     "PowerZoneRead",
     "Meal",

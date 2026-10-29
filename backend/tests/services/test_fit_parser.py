@@ -6,7 +6,8 @@ import pytest
 
 from app.schemas.enums.series_types import SeriesType
 from app.services.fit_parser import FitParseResult, parse_fit_file
-from tests.fixtures.fit_builder import make_cycling_fit, make_running_fit, make_swimming_fit
+from app.services.workout_samples_service import WorkoutSamplesService
+from tests.fixtures.fit_builder import make_cycling_fit, make_running_fit, make_strength_fit, make_swimming_fit
 
 USER_ID = uuid4()
 DS_ID = uuid4()
@@ -155,3 +156,36 @@ class TestInvalidInput:
     def test_garbage_bytes_raises(self) -> None:
         with pytest.raises(fitdecode.FitError):
             parse_fit_file(b"not a fit file at all", uuid4(), uuid4())
+
+
+class TestStrengthSets:
+    """Garmin writes one `set` message per set of a Strength activity; work sets
+    become segments of kind "set" (rest periods dropped), which the samples
+    endpoint returns as `sets` and HOS turns into a muscle map."""
+
+    @pytest.fixture(scope="class")
+    def strength(self) -> FitParseResult:
+        return parse_fit_file(make_strength_fit(), USER_ID, DS_ID, source="garmin")
+
+    def test_rest_periods_are_left_out(self, strength: FitParseResult) -> None:
+        sets = [s for s in strength.segments if s["kind"] == "set"]
+        assert len(sets) == 3
+
+    def test_named_sets_carry_exercise_reps_and_weight(self, strength: FitParseResult) -> None:
+        squat, bench, _ = [s for s in strength.segments if s["kind"] == "set"]
+        assert squat["exercise_category"] == "squat"
+        assert squat["repetitions"] == 8
+        assert squat["weight_kg"] == 60.0
+        assert squat["elapsed_seconds"] == 40.0
+        assert bench["exercise_category"] == "bench_press"
+
+    def test_an_unnamed_set_says_unknown(self, strength: FitParseResult) -> None:
+        last = [s for s in strength.segments if s["kind"] == "set"][-1]
+        assert last["exercise_category"] == "unknown"
+        assert last["repetitions"] == 12
+
+    def test_samples_endpoint_shape(self, strength: FitParseResult) -> None:
+        sets = WorkoutSamplesService._sets(strength.segments)
+        assert [s.exercise_category for s in sets] == ["squat", "bench_press", "unknown"]
+        assert sets[0].duration_seconds == 40.0
+        assert WorkoutSamplesService._laps(strength.segments) == []
