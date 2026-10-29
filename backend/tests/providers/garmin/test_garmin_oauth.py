@@ -5,12 +5,13 @@ from uuid import uuid4
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app.models import User
+from app.models import User, UserConnection
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.repositories.user_repository import UserRepository
-from app.schemas.auth import AuthenticationMethod
+from app.schemas.auth import AuthenticationMethod, ConnectionStatus
 from app.schemas.model_crud.credentials import (
     OAuthState,
     OAuthTokenResponse,
@@ -402,3 +403,25 @@ class TestGarminOAuth:
         # Act & Assert
         with pytest.raises(httpx.HTTPStatusError):
             garmin_oauth.deregister_user("expired_token")
+
+
+class TestGarminRejectedRefreshKeepsConnection:
+    """A rejected refresh (e.g. while downloading a FIT file) must not revoke Garmin."""
+
+    def test_rejected_refresh_raises_but_connection_stays_active(self, db: Session) -> None:
+        oauth = GarminOAuth(
+            user_repo=UserRepository(User),
+            connection_repo=UserConnectionRepository(),
+            provider_name="garmin",
+            api_base_url="https://apis.garmin.com",
+        )
+        connection = UserConnectionFactory(provider="garmin", refresh_token="dead")
+        db.commit()
+        rejected = MagicMock()
+        rejected.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "rejected", request=MagicMock(), response=MagicMock(status_code=401, text="Unauthorized")
+        )
+        with patch("httpx.post", return_value=rejected), pytest.raises(HTTPException):
+            oauth.refresh_access_token(db, connection.user_id, "dead")
+        db.expire_all()
+        assert db.get(UserConnection, connection.id).status == ConnectionStatus.ACTIVE

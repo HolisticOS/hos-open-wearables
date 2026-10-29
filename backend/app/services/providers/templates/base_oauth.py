@@ -84,6 +84,9 @@ class BaseOAuthTemplate(ABC):
 
     use_pkce: bool = False
     auth_method: AuthenticationMethod = AuthenticationMethod.BASIC_AUTH
+    # Whether a refresh the provider rejects (400/401) revokes the connection.
+    # A push provider keeps receiving data with dead tokens, so it says False.
+    revoke_on_refresh_reject: bool = True
     # When True, one provider account can be linked to only one OW user at a
     # time: a new connection revokes any other active connection for the same
     # provider_user_id (latest wins). Off by default because sharing one provider
@@ -170,14 +173,17 @@ class BaseOAuthTemplate(ABC):
         return oauth_state
 
     def refresh_access_token(
-        self, db: DbSession, user_id: UUID, refresh_token: str, *, revoke_on_reject: bool = True
+        self, db: DbSession, user_id: UUID, refresh_token: str, *, revoke_on_reject: bool | None = None
     ) -> OAuthTokenResponse:
         """Refreshes the access token using the refresh token.
 
-        A 400/401 from the provider revokes the connection, unless revoke_on_reject is False:
-        a push-only connection still receives its data without a token, so a background
-        refresh that fails must not cut it off.
+        A 400/401 from the provider revokes the connection, unless revoke_on_reject (or the
+        provider's revoke_on_refresh_reject when it isn't given) is False: a push-only
+        connection still receives its data without a token, so a refresh that fails must
+        not cut it off.
         """
+        if revoke_on_reject is None:
+            revoke_on_reject = self.revoke_on_refresh_reject
         data, headers = self._prepare_refresh_request(refresh_token)
 
         try:

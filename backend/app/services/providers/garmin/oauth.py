@@ -43,6 +43,11 @@ class GarminOAuth(BaseOAuthTemplate):
     # Garmin pushes data per Garmin account. Linking one account to several OW
     # users would duplicate every push, so the newest connection wins.
     single_owner_per_account = True
+    # Garmin pushes data whatever our tokens, and tells us itself when a user
+    # disconnects (deregistration / permissions push). A rejected refresh only
+    # costs FIT files and backfills, so it must not revoke: it used to, on every
+    # new activity's FIT download, dropping every push after it (2026-10-28).
+    revoke_on_refresh_reject = False
 
     def deregister_user(self, access_token: str) -> None:
         """Call Garmin's user deregistration endpoint to remove the app association."""
