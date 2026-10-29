@@ -229,3 +229,41 @@ def make_swimming_fit(n_records: int = 10) -> bytes:
     for i in range(n_records):
         messages += _data_msg(fields, [start_ts + i, 140 + i % 8])
     return _fit_file(messages)
+
+
+# Set message (global_mesg_num=225), written by Garmin for Strength activities:
+#   254  timestamp          uint32
+#     0  duration           uint32  (raw = seconds * 1000)
+#     3  repetitions        uint16
+#     4  weight             uint16  (raw = kg * 16)
+#     5  set_type           uint8   (0 rest, 1 active)
+#     6  start_time         uint32
+#     7  category           uint16  (exercise_category: 0 bench_press, 23 row, 28 squat, 65534 unknown)
+_SET_FIELDS: list[_Field] = [
+    _Field(254, _UINT32, 4),
+    _Field(0, _UINT32, 4),
+    _Field(3, _UINT16, 2),
+    _Field(4, _UINT16, 2),
+    _Field(5, _UINT8, 1),
+    _Field(6, _UINT32, 4),
+    _Field(7, _UINT16, 2),
+]
+
+
+def make_strength_fit() -> bytes:
+    """Synthetic strength session: squat, a rest, bench press, and one set the watch could not name."""
+    start_ts = _fit_ts(datetime(2025, 6, 4, 18, 0, 0, tzinfo=timezone.utc))
+    sets = [  # (offset_s, duration_s, reps, weight_kg, set_type, category)
+        (0, 40, 8, 60, 1, 28),
+        (40, 90, 0, 0, 0, 28),
+        (130, 35, 10, 50, 1, 0),
+        (200, 30, 12, 0, 1, 65534),
+    ]
+    messages = _definition_msg(_SET_FIELDS, local_type=2, global_num=225)
+    for offset, duration, reps, weight, set_type, category in sets:
+        messages += _data_msg(
+            _SET_FIELDS,
+            [start_ts + offset + duration, duration * 1000, reps, weight * 16, set_type, start_ts + offset, category],
+            local_type=2,
+        )
+    return _fit_file(messages)

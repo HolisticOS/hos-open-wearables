@@ -118,6 +118,23 @@ class WorkoutLap(BaseModel):
     max_speed_mps: float | None = None
 
 
+class WorkoutSet(BaseModel):
+    """One work set from a strength activity's FIT file (rest periods are left out).
+
+    `exercise_category` is the FIT exercise_category name (squat, bench_press, row,
+    ...) or "unknown" when the watch could not tell; `exercise_subtype` is the
+    category-specific sub-type as the file stores it.
+    """
+
+    index: int
+    start_time: datetime | None = None
+    duration_seconds: float | None = None
+    exercise_category: str = "unknown"
+    exercise_subtype: str | None = None
+    repetitions: int | None = None
+    weight_kg: float | None = None
+
+
 class HeartRateZoneRead(BaseModel):
     zone: int
     min_bpm: int | None = None
@@ -144,6 +161,9 @@ class WorkoutSamples(BaseModel):
         default_factory=list, description="[timestamp, latitude, longitude]; real recorded points, never averaged"
     )
     laps: list[WorkoutLap] = Field(default_factory=list)
+    sets: list[WorkoutSet] = Field(
+        default_factory=list, description="Strength work sets from the FIT file; empty for other activities"
+    )
     zones: dict[str, list[HeartRateZoneRead] | list[PowerZoneRead]] = Field(
         default_factory=dict, description="Time in zone from the FIT file; keys present only when stored"
     )
