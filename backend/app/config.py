@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import warnings
-from datetime import timedelta
+from datetime import date, timedelta
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
@@ -107,6 +107,10 @@ class Settings(BaseSettings):
     # data_point_series on workout webhook arrival. Significantly increases DB storage.
     # Per-provider granularity will be added via ProviderSetting in a future release.
     ingest_workout_samples: bool = False
+
+    # First day the device-fault override applies to daily summaries (null = off). Earlier
+    # days keep the plain priority result, so a re-sync never rewrites history.
+    source_fault_rule_from: date | None = date(2026, 11, 10)
 
     # Whether to store raw FIT files in S3 when received via provider APIs.
     # Independent of ingest_workout_samples (DB samples) and raw_payload_storage (JSON payloads).

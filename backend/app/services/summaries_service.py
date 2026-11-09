@@ -1,9 +1,11 @@
 """Service for daily summaries (sleep, activity, recovery, body)."""
 
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from logging import Logger, getLogger
 from uuid import UUID
 
+from app.config import settings
 from app.database import DbSession
 from app.models import DataPointSeries, EventRecord, HealthScore, ProviderPriority, User
 from app.repositories import EventRecordRepository, ProviderPriorityRepository
@@ -44,6 +46,7 @@ from app.schemas.utils import (
     SourceMetadata,
     TimeseriesMetadata,
 )
+from app.services.source_fault_rule import apply_activity_fault_rule, apply_sleep_fault_rule, rule_applies
 from app.utils.exceptions import handle_exceptions
 from app.utils.pagination import (
     decode_activity_cursor,
@@ -125,6 +128,7 @@ class SummariesService:
         results: list[dict] | list,
         date_key: str = "activity_date",
         fallback_groups: tuple[tuple[str, ...], ...] = (),
+        fault_rule: Callable[[list[dict], dict], dict] | None = None,
     ) -> list[dict] | list:
         """Filter results to highest priority source per date.
 
@@ -133,6 +137,8 @@ class SummariesService:
             date_key: Key name for date field (activity_date or sleep_date)
             fallback_groups: Metric keys the winning entry may take from the next
                 source down when it has no value for them (None or 0)
+            fault_rule: Replaces values from a lower-priority source when the winner
+                looks faulty, for days on or after settings.source_fault_rule_from
 
         Returns:
             Filtered list with only highest priority entry per date
@@ -178,7 +184,10 @@ class SummariesService:
                 return (provider_priority, device_type_priority, device_model or "")
 
             entries_sorted = sorted(entries, key=sort_key)
-            filtered.append(self._fill_from_fallbacks(entries_sorted, fallback_groups))
+            winner = self._fill_from_fallbacks(entries_sorted, fallback_groups)
+            if fault_rule is not None and rule_applies(dt, settings.source_fault_rule_from):
+                winner = fault_rule(entries_sorted, winner)
+            filtered.append(winner)
 
         return filtered
 
@@ -332,7 +341,9 @@ class SummariesService:
         results = self.event_record_repo.get_sleep_summaries(db_session, user_id, start_date, end_date, cursor, limit)
 
         # Filter by priority to get best source per date
-        results = self._filter_by_priority(db_session, user_id, results, date_key="sleep_date")
+        results = self._filter_by_priority(
+            db_session, user_id, results, date_key="sleep_date", fault_rule=apply_sleep_fault_rule
+        )
         provider_order = ProviderPriorityRepository(ProviderPriority).get_priority_order(db_session)
 
         # Check if there's more data
@@ -550,7 +561,12 @@ class SummariesService:
 
         # Filter by priority to get best source per date
         results = self._filter_by_priority(
-            db_session, user_id, results, date_key="activity_date", fallback_groups=ACTIVITY_FALLBACK_GROUPS
+            db_session,
+            user_id,
+            results,
+            date_key="activity_date",
+            fallback_groups=ACTIVITY_FALLBACK_GROUPS,
+            fault_rule=apply_activity_fault_rule,
         )
 
         # Get workout aggregates (elevation, distance, energy from workouts)
