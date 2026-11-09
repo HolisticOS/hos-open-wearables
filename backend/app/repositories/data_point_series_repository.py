@@ -831,6 +831,18 @@ class DataPointSeriesRepository(
                 func.min(case((self.model.series_type_definition_id == hr_id, self.model.value), else_=None)).label(
                     "hr_min"
                 ),
+                # Hours of the day with heart rate: how long the device was actually worn
+                func.count(
+                    func.distinct(
+                        case(
+                            (
+                                self.model.series_type_definition_id == hr_id,
+                                func.date_trunc("hour", self.model.recorded_at),
+                            ),
+                            else_=None,
+                        )
+                    )
+                ).label("hr_hours"),
                 # Distance - prefer daily total, else sum samples (NULL when no data)
                 prefer_daily_sum(distance_id).label("distance_sum"),
                 # Flights climbed - prefer daily total, else sum samples (NULL when no data)
@@ -873,6 +885,7 @@ class DataPointSeriesRepository(
                     "hr_avg": int(round(float(row.hr_avg))) if row.hr_avg is not None else None,
                     "hr_max": int(row.hr_max) if row.hr_max is not None else None,
                     "hr_min": int(row.hr_min) if row.hr_min is not None else None,
+                    "hr_hours": int(row.hr_hours or 0),
                     "distance_sum": float(row.distance_sum) if row.distance_sum is not None else None,
                     "flights_climbed_sum": int(row.flights_climbed_sum)
                     if row.flights_climbed_sum is not None

@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from pydantic import BaseModel
 
@@ -36,6 +36,7 @@ class ActivityAggregateResult(TypedDict):
     distance_sum: float | None
     flights_climbed_sum: int | None
     active_time_minutes: int | None  # Provider-reported daily active time; None when not reported
+    hr_hours: NotRequired[int]  # Hours of the day with heart rate; absent on archived rows
 
 
 class ActiveMinutesResult(TypedDict):
