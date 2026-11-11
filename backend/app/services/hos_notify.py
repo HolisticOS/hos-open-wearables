@@ -11,13 +11,13 @@ Best-effort throughout: a broken Redis or HOS never fails ingestion.
 """
 
 from collections.abc import Iterable
-from logging import getLogger
 from uuid import UUID
 
 from app.config import settings
 from app.integrations.redis_client import get_redis_client
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 NOTIFY_TASK = "app.integrations.celery.tasks.notify_hos_task.notify_hos"
 
@@ -39,7 +39,7 @@ def take_pending(user_id: str) -> bool:
     try:
         return get_redis_client().getdel(_pending_key(user_id)) is not None
     except Exception:
-        logger.warning("hos_notify: could not read pending flag for %s", user_id, exc_info=True)
+        logger.warning("hos_notify: could not read pending flag", user_id=user_id, exc_info=True)
         return True  # unsure, so send: an extra refresh is cheaper than a missed one
 
 
@@ -59,4 +59,4 @@ def schedule_hos_notify(user_ids: Iterable[UUID | str], provider: str) -> None:
             else:
                 redis.set(_pending_key(raw), provider, ex=window * 6)
         except Exception:
-            logger.warning("hos_notify: could not schedule notify for %s", raw, exc_info=True)
+            logger.warning("hos_notify: could not schedule notify", user_id=str(raw), exc_info=True)

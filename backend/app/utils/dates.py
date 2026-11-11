@@ -1,5 +1,7 @@
-from datetime import datetime, timezone
-from typing import Annotated
+import re
+from contextlib import suppress
+from datetime import date, datetime, time, timedelta, timezone
+from typing import Annotated, overload
 
 from fastapi import Query
 from pydantic import BeforeValidator, Field
@@ -8,8 +10,11 @@ from app.utils.exceptions import DatetimeParseError
 
 _DATE_PARAM_DESCRIPTION = (
     "ISO 8601 datetime (e.g. `2023-11-07T05:31:56Z`) or Unix timestamp in seconds. "
-    "Date-only strings (e.g. `2023-11-07`) are also accepted and normalized to midnight UTC."
+    "Date-only strings (e.g. `2023-11-07`) are also accepted and cover the whole day, "
+    "so a date-only range includes both boundary days."
 )
+
+_DATE_ONLY_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 DateTimeQueryParam = Annotated[
     str,
@@ -49,6 +54,9 @@ def parse_query_datetime(dt_str: str) -> datetime:
     try:
         timestamp = float(dt_str)
         return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    except (OverflowError, OSError):
+        # "inf", "1e17", "1e20", ... parse as floats but do not fit a datetime (OSError on some platforms)
+        raise DatetimeParseError(dt_str)
     except ValueError:
         pass
 
@@ -56,6 +64,17 @@ def parse_query_datetime(dt_str: str) -> datetime:
         return datetime.fromisoformat(dt_str)
     except ValueError:
         raise DatetimeParseError(dt_str)
+
+
+def parse_query_end_datetime(dt_str: str) -> datetime:
+    """Parse an end-of-range bound. A date-only string spans that whole day.
+
+    Bounds are compared with `<`, so a date-only end resolves to the start of the next day.
+    """
+    if _DATE_ONLY_RE.fullmatch(dt_str):
+        with suppress(ValueError, OverflowError):
+            return datetime.combine(date.fromisoformat(dt_str) + timedelta(days=1), time.min)
+    return parse_query_datetime(dt_str)
 
 
 def parse_iso_datetime(dt_str: str | None) -> datetime | None:
@@ -115,6 +134,39 @@ def parse_webhook_data_timestamp(data_timestamp: str | None) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def align_tz_awareness(start: datetime | None, end: datetime | None) -> tuple[datetime | None, datetime | None]:
+    """Give a naive edge of a time window the sibling edge's offset.
+
+    Two naive or two aware datetimes already compare; only a mixed pair raises
+    TypeError. Both edges come from the same device in the same zone, so the known
+    offset is the right one to borrow — no UTC is assumed and neither wall clock moves.
+    """
+    if start is not None and end is not None and (start.tzinfo is None) != (end.tzinfo is None):
+        if start.tzinfo is None:
+            return start.replace(tzinfo=end.tzinfo), end
+        return start, end.replace(tzinfo=start.tzinfo)
+    return start, end
+
+
+@overload
+def as_utc(moment: datetime) -> datetime: ...
+@overload
+def as_utc(moment: None) -> None: ...
+def as_utc(moment: datetime | None) -> datetime | None:
+    """Return the same instant as a UTC-aware datetime; a naive input is read as UTC."""
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def to_rfc3339(dt: datetime) -> str:
+    """Format a datetime as RFC3339 UTC with a 'Z' suffix; naive datetimes are assumed UTC."""
+    aware = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+    return aware.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def offset_to_iso(offset_seconds: int | None) -> str | None:
     """Convert a timezone offset in seconds to ISO 8601 format (e.g. 3600 -> '+01:00')."""
     if offset_seconds is None:
@@ -124,3 +176,28 @@ def offset_to_iso(offset_seconds: int | None) -> str | None:
     hours, remainder = divmod(total, 3600)
     minutes = remainder // 60
     return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def iso_to_timezone(offset: str) -> timezone:
+    """Convert an ISO 8601 offset to a fixed timezone (e.g. '-05:30' -> UTC-05:30)."""
+    sign = -1 if offset.startswith("-") else 1
+    hours, minutes = offset[1:].split(":")
+    return timezone(sign * timedelta(hours=int(hours), minutes=int(minutes)))
+
+
+def local_date(dt: datetime, zone_offset: str | None) -> date:
+    """The calendar day of an instant at its offset, as SQL readers compute it; no offset is UTC."""
+    return dt.astimezone(iso_to_timezone(zone_offset or "+00:00")).date()
+
+
+def offset_of(dt: datetime) -> str | None:
+    """The ISO 8601 offset of an aware datetime, None for a naive one."""
+    offset = dt.utcoffset()
+    return None if offset is None else offset_to_iso(int(offset.total_seconds()))
+
+
+def window_seconds(start: datetime | None, end: datetime | None) -> int | None:
+    """Width of a value reported over [start, end); None for an instant, a span under a second or a missing end."""
+    if start is None or end is None or end <= start:
+        return None
+    return int((end - start).total_seconds()) or None

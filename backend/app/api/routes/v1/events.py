@@ -1,24 +1,54 @@
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, status
 
 from app.database import DbSession
-from app.schemas.enums import SeriesType
-from app.schemas.model_crud.activities import EventRecordQueryParams
+from app.schemas.enums import EventCategory, ProviderName, SeriesType, SourceSelection, WorkoutType
+from app.schemas.model_crud.activities import EventRecordQueryParams, SleepInclude, WorkoutInclude
 from app.schemas.responses.activity import (
+    Meal,
     MenstrualCycleRecord,
     SleepSession,
+    SleepTotals,
     Workout,
     WorkoutSamples,
+    WorkoutTotals,
 )
 from app.schemas.utils import PaginatedResponse
 from app.services import ApiKeyDep
 from app.services.event_record_service import event_record_service
 from app.services.workout_samples_service import WORKOUT_SAMPLE_TYPES, workout_samples_service
-from app.utils.dates import DateTimeQueryParam, parse_query_datetime
+from app.utils.dates import DateTimeQueryParam, parse_query_datetime, parse_query_end_datetime
+from app.utils.pagination import DEFAULT_PAGE_SIZE, PageLimitQueryParam
 
 router = APIRouter()
+
+# Shared by each list and the totals that add it up, so the two cannot drift apart.
+WorkoutTypeQuery = Annotated[
+    WorkoutType | None,
+    Query(alias="type", description="Exact normalized workout type. Unlike `record_type`, does not substring-match."),
+]
+IsNapQuery = Annotated[
+    bool | None,
+    Query(description="When true, return only naps; when false, only main sleep. Omit to return both."),
+]
+SessionSourceSelectionQuery = Annotated[
+    Literal[SourceSelection.ALL, SourceSelection.PER_SESSION] | None,
+    Query(
+        description="`all` returns every source's sessions. `per_session` drops a session when the sessions of one "
+        "source ranked higher by provider, then device type priority, cover at least `SESSION_DUPLICATE_OVERLAP` of "
+        "it (default 0.5); sessions nothing better covers stay, and equally ranked sources never hide each other. "
+        "Source filters narrow which sessions compete. Defaults to `all`."
+    ),
+]
+FilterByPriorityQuery = Annotated[bool, Query(deprecated=True, description="Same as source_selection=per_session.")]
+
+
+def _session_selection(source_selection: SourceSelection | None, filter_by_priority: bool) -> SourceSelection:
+    if source_selection is not None:
+        return source_selection
+    return SourceSelection.PER_SESSION if filter_by_priority else SourceSelection.ALL
 
 
 @router.get("/users/{user_id}/events/workouts")
@@ -28,27 +58,79 @@ def list_workouts(
     end_date: DateTimeQueryParam,
     db: DbSession,
     _api_key: ApiKeyDep,
+    include: Annotated[list[WorkoutInclude], Query(default_factory=list)],
     record_type: str | None = None,
+    workout_type: WorkoutTypeQuery = None,
     cursor: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=100)] = 50,
-    filter_by_priority: Annotated[
-        bool,
-        Query(
-            description="When true, a session recorded by two providers (e.g. Garmin and Garmin Connect's copy "
-            "in Apple Health) is returned once, from the higher-priority provider. Defaults to false for "
-            "backwards compatibility."
-        ),
-    ] = False,
+    limit: PageLimitQueryParam = DEFAULT_PAGE_SIZE,
+    provider: ProviderName | None = None,
+    source: str | None = None,
+    device_model: str | None = None,
+    data_source_id: UUID | None = None,
+    source_selection: SessionSourceSelectionQuery = None,
+    filter_by_priority: FilterByPriorityQuery = False,
 ) -> PaginatedResponse[Workout]:
     """Returns workout sessions."""
     params = EventRecordQueryParams(
         start_datetime=parse_query_datetime(start_date),
-        end_datetime=parse_query_datetime(end_date),
+        end_datetime=parse_query_end_datetime(end_date),
         cursor=cursor,
         limit=limit,
         record_type=record_type,
+        workout_type=workout_type,
+        provider=provider,
+        source=source,
+        device_model=device_model,
+        data_source_id=data_source_id,
     )
-    return event_record_service.get_workouts(db, user_id, params, filter_by_priority=filter_by_priority)
+    return event_record_service.get_workouts(
+        db, user_id, params, include=include, source_selection=_session_selection(source_selection, filter_by_priority)
+    )
+
+
+@router.get("/users/{user_id}/events/workouts/types")
+def list_workout_types(
+    user_id: UUID,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+) -> list[str]:
+    """Returns the workout types this user actually has, for populating a filter."""
+    return event_record_service.get_workout_types(db, user_id)
+
+
+@router.get("/users/{user_id}/events/workouts/totals")
+def get_workout_totals(
+    user_id: UUID,
+    start_date: DateTimeQueryParam,
+    end_date: DateTimeQueryParam,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+    record_type: str | None = None,
+    workout_type: WorkoutTypeQuery = None,
+    provider: ProviderName | None = None,
+    source: str | None = None,
+    device_model: str | None = None,
+    data_source_id: UUID | None = None,
+    source_selection: SessionSourceSelectionQuery = None,
+) -> WorkoutTotals:
+    """Returns the count, duration, energy and distance of the workouts the same filters would list.
+
+    Added up in the database, so it covers every matching workout however many
+    there are, without paging through them.
+    """
+    params = EventRecordQueryParams(
+        start_datetime=parse_query_datetime(start_date),
+        end_datetime=parse_query_end_datetime(end_date),
+        record_type=record_type,
+        workout_type=workout_type,
+        provider=provider,
+        source=source,
+        device_model=device_model,
+        data_source_id=data_source_id,
+    )
+    return event_record_service.get_workout_totals(
+        db, user_id, params, source_selection=source_selection or SourceSelection.ALL
+    )
 
 
 @router.get("/users/{user_id}/events/workouts/{workout_id}/samples")
@@ -87,24 +169,68 @@ def list_sleep_sessions(
     end_date: DateTimeQueryParam,
     db: DbSession,
     _api_key: ApiKeyDep,
+    include: Annotated[list[SleepInclude], Query(default_factory=list)],
     cursor: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=100)] = 50,
-    filter_by_priority: Annotated[
-        bool,
-        Query(
-            description="When true, keep only the highest-priority source's sessions per sleep date "
-            "(provider/device priority, same ranking as summaries). Defaults to false for backwards compatibility."
-        ),
-    ] = False,
+    limit: PageLimitQueryParam = DEFAULT_PAGE_SIZE,
+    provider: ProviderName | None = None,
+    source: str | None = None,
+    device_model: str | None = None,
+    data_source_id: UUID | None = None,
+    is_nap: IsNapQuery = None,
+    source_selection: SessionSourceSelectionQuery = None,
+    filter_by_priority: FilterByPriorityQuery = False,
 ) -> PaginatedResponse[SleepSession]:
     """Returns sleep sessions (including naps)."""
     params = EventRecordQueryParams(
         start_datetime=parse_query_datetime(start_date),
-        end_datetime=parse_query_datetime(end_date),
+        end_datetime=parse_query_end_datetime(end_date),
         cursor=cursor,
         limit=limit,
+        provider=provider,
+        source=source,
+        device_model=device_model,
+        data_source_id=data_source_id,
+        is_nap=is_nap,
     )
-    return event_record_service.get_sleep_sessions(db, user_id, params, filter_by_priority=filter_by_priority)
+    return event_record_service.get_sleep_sessions(
+        db, user_id, params, source_selection=_session_selection(source_selection, filter_by_priority), include=include
+    )
+
+
+@router.get("/users/{user_id}/events/sleep/totals")
+def get_sleep_totals(
+    user_id: UUID,
+    start_date: DateTimeQueryParam,
+    end_date: DateTimeQueryParam,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+    provider: ProviderName | None = None,
+    source: str | None = None,
+    device_model: str | None = None,
+    data_source_id: UUID | None = None,
+    is_nap: IsNapQuery = None,
+    source_selection: SessionSourceSelectionQuery = None,
+    filter_by_priority: FilterByPriorityQuery = False,
+) -> SleepTotals:
+    """Returns the count, naps, time asleep, time in bed and mean efficiency of the sessions.
+
+    The same filters as the sleep list, so it adds up exactly what that would page through.
+
+    Added up in the database, so it covers every matching session however many
+    there are, without paging through them.
+    """
+    params = EventRecordQueryParams(
+        start_datetime=parse_query_datetime(start_date),
+        end_datetime=parse_query_end_datetime(end_date),
+        provider=provider,
+        source=source,
+        device_model=device_model,
+        data_source_id=data_source_id,
+        is_nap=is_nap,
+    )
+    return event_record_service.get_sleep_totals(
+        db, user_id, params, source_selection=_session_selection(source_selection, filter_by_priority)
+    )
 
 
 @router.get("/users/{user_id}/events/menstrual-cycles")
@@ -115,16 +241,52 @@ def list_menstrual_cycles(
     db: DbSession,
     _api_key: ApiKeyDep,
     cursor: str | None = None,
-    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    limit: PageLimitQueryParam = DEFAULT_PAGE_SIZE,
+    provider: ProviderName | None = None,
+    source: str | None = None,
+    device_model: str | None = None,
+    data_source_id: UUID | None = None,
 ) -> PaginatedResponse[MenstrualCycleRecord]:
     """Returns menstrual cycle records."""
     params = EventRecordQueryParams(
         start_datetime=parse_query_datetime(start_date),
-        end_datetime=parse_query_datetime(end_date),
+        end_datetime=parse_query_end_datetime(end_date),
         cursor=cursor,
         limit=limit,
+        provider=provider,
+        source=source,
+        device_model=device_model,
+        data_source_id=data_source_id,
     )
     return event_record_service.get_menstrual_cycles(db, user_id, params)
+
+
+@router.get("/users/{user_id}/events/meals")
+def list_meals(
+    user_id: UUID,
+    start_date: DateTimeQueryParam,
+    end_date: DateTimeQueryParam,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+    cursor: str | None = None,
+    limit: PageLimitQueryParam = DEFAULT_PAGE_SIZE,
+    provider: ProviderName | None = None,
+    source: str | None = None,
+    device_model: str | None = None,
+    data_source_id: UUID | None = None,
+) -> PaginatedResponse[Meal]:
+    """Returns meals (nutrition entries)."""
+    params = EventRecordQueryParams(
+        start_datetime=parse_query_datetime(start_date),
+        end_datetime=parse_query_end_datetime(end_date),
+        cursor=cursor,
+        limit=limit,
+        provider=provider,
+        source=source,
+        device_model=device_model,
+        data_source_id=data_source_id,
+    )
+    return event_record_service.get_meals(db, user_id, params)
 
 
 @router.delete("/users/{user_id}/events/workouts/{workout_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -135,7 +297,7 @@ def delete_workout(
     _api_key: ApiKeyDep,
 ) -> None:
     """Delete a workout session."""
-    if not event_record_service.delete_event_record(db, user_id, workout_id, "workout"):
+    if not event_record_service.delete_event_record(db, user_id, workout_id, EventCategory.WORKOUT):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workout not found")
 
 
@@ -147,7 +309,7 @@ def delete_sleep_session(
     _api_key: ApiKeyDep,
 ) -> None:
     """Delete a sleep session."""
-    if not event_record_service.delete_event_record(db, user_id, sleep_id, "sleep"):
+    if not event_record_service.delete_event_record(db, user_id, sleep_id, EventCategory.SLEEP):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Sleep session not found")
 
 
@@ -159,5 +321,17 @@ def delete_menstrual_cycle(
     _api_key: ApiKeyDep,
 ) -> None:
     """Delete a menstrual cycle record."""
-    if not event_record_service.delete_event_record(db, user_id, cycle_id, "menstrual_cycle"):
+    if not event_record_service.delete_event_record(db, user_id, cycle_id, EventCategory.MENSTRUAL_CYCLE):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Menstrual cycle record not found")
+
+
+@router.delete("/users/{user_id}/events/meals/{meal_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_meal(
+    user_id: UUID,
+    meal_id: UUID,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+) -> None:
+    """Delete a meal together with its nutrients."""
+    if not event_record_service.delete_event_record(db, user_id, meal_id, EventCategory.MEAL):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Meal not found")

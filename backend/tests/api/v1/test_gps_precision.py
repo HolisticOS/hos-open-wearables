@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import DataPointSeries, EventRecord
+from app.models import EventRecord, SeriesSample
 from app.repositories.data_point_series_repository import DataPointSeriesRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ProviderName, SeriesType
@@ -70,7 +70,7 @@ def _push_route(db: Session, garmin_247: Garmin247Data, user: Any) -> None:
     }
     samples = garmin_247._build_activity_samples(user.id, item)
     assert {s.series_type for s in samples} == {SeriesType.latitude_e4, SeriesType.longitude_e4}
-    DataPointSeriesRepository(DataPointSeries).bulk_create(db, samples)
+    DataPointSeriesRepository(SeriesSample).bulk_create(db, samples)
     db.flush()
 
 
@@ -88,14 +88,14 @@ def _legacy_rows(db: Session, user: Any, seconds: range, lat: float, lon: float)
         for i in seconds
         for series_type, value in ((SeriesType.latitude, lat), (SeriesType.longitude, lon))
     ]
-    DataPointSeriesRepository(DataPointSeries).bulk_create(db, samples)
+    DataPointSeriesRepository(SeriesSample).bulk_create(db, samples)
     db.flush()
 
 
 def _route(client: TestClient, user: Any, workout: EventRecord) -> list[list[Any]]:
     response = client.get(
         f"/api/v1/users/{user.id}/events/workouts/{workout.id}/samples",
-        headers=api_key_headers(ApiKeyFactory().id),
+        headers=api_key_headers(ApiKeyFactory().plain_key),
         params={"types": ["latitude", "longitude"]},
     )
     assert response.status_code == 200, response.text
@@ -113,7 +113,7 @@ def _timeseries(client: TestClient, user: Any, types: list[str] | None = None) -
     rows: list[dict[str, Any]] = []
     while True:
         response = client.get(
-            f"/api/v1/users/{user.id}/timeseries", headers=api_key_headers(ApiKeyFactory().id), params=params
+            f"/api/v1/users/{user.id}/timeseries", headers=api_key_headers(ApiKeyFactory().plain_key), params=params
         )
         assert response.status_code == 200, response.text
         body = response.json()

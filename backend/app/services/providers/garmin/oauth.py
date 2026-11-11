@@ -1,5 +1,3 @@
-import logging
-
 import httpx
 from starlette.status import HTTP_502_BAD_GATEWAY
 
@@ -14,9 +12,9 @@ from app.schemas.model_crud.credentials import (
     ProviderEndpoints,
 )
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate, OAuthConnectionError
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class GarminOAuth(BaseOAuthTemplate):
@@ -49,7 +47,7 @@ class GarminOAuth(BaseOAuthTemplate):
     # new activity's FIT download, dropping every push after it (2026-10-28).
     revoke_on_refresh_reject = False
 
-    def deregister_user(self, access_token: str) -> None:
+    def deregister_user(self, access_token: str, provider_user_id: str | None = None) -> None:
         """Call Garmin's user deregistration endpoint to remove the app association."""
         response = httpx.delete(
             f"{self.api_base_url}/partner-gateway/rest/user/registration",
@@ -57,6 +55,15 @@ class GarminOAuth(BaseOAuthTemplate):
             timeout=30.0,
         )
         response.raise_for_status()
+
+    def get_user_id(self, access_token: str) -> str | None:
+        response = httpx.get(
+            f"{self.api_base_url}/partner-gateway/rest/user/id",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        return response.json().get("userId")
 
     def _get_provider_user_info(self, token_response: OAuthTokenResponse, user_id: str) -> dict[str, str | None]:
         """Fetches Garmin user ID and API permissions.
@@ -80,10 +87,9 @@ class GarminOAuth(BaseOAuthTemplate):
             failure = str(e)
 
         if not provider_user_id:
-            log_structured(
-                logger,
-                "error",
-                f"Garmin user id lookup failed, connection not saved: {failure}",
+            logger.error(
+                "Garmin user id lookup failed, connection not saved",
+                failure=failure,
                 provider="garmin",
                 task="get_provider_user_info",
                 user_id=user_id,
@@ -108,11 +114,12 @@ class GarminOAuth(BaseOAuthTemplate):
             permissions = data.get("permissions", [])
             if permissions:
                 scope = " ".join(sorted(permissions))
-        except Exception:
+        except Exception as e:
             logger.warning(
-                "Failed to fetch Garmin permissions for user %s, will retry via webhook",
-                provider_user_id,
-                exc_info=True,
+                "Failed to fetch Garmin permissions, will retry via webhook",
+                provider="garmin",
+                provider_user_id=provider_user_id,
+                exc_info=e,
             )
 
         return {"user_id": provider_user_id, "username": None, "scope": scope}

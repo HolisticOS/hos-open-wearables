@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.integrations.celery.tasks.delete_provider_data_task import delete_provider_data as delete_task
-from app.models import DataPointSeries, DataSource, EventRecord, HealthScore, User, WorkoutDetails
+from app.models import DataSource, EventRecord, HealthScore, SeriesSample, User, WorkoutDetails
 from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import ProviderName
 from app.services import provider_data_deletion
@@ -42,7 +42,7 @@ def _seed(user: User, provider: ProviderName) -> DataSource:
 def _counts(db: Session, source_id: UUID) -> tuple[int, int, int]:
     return (
         db.query(EventRecord).filter(EventRecord.data_source_id == source_id).count(),
-        db.query(DataPointSeries).filter(DataPointSeries.data_source_id == source_id).count(),
+        db.query(SeriesSample).filter(SeriesSample.data_source_id == source_id).count(),
         db.query(HealthScore).filter(HealthScore.data_source_id == source_id).count(),
     )
 

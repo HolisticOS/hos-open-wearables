@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.auth import LiveSyncMode
+from app.schemas.enums import DataGranularity
 
 
 class ProviderSettingRead(BaseModel):
@@ -10,6 +11,10 @@ class ProviderSettingRead(BaseModel):
     name: str = Field(..., description="Display name (e.g., 'Apple Health', 'Garmin')")
     has_cloud_api: bool = Field(..., description="Whether provider uses cloud OAuth API")
     is_enabled: bool = Field(..., description="Whether provider is enabled by admin")
+    credentials_configured: bool = Field(
+        True,
+        description="Whether the OAuth client ID and secret are set. Always true for SDK-only providers.",
+    )
     icon_url: str = Field(
         ...,
         description=(
@@ -25,6 +30,10 @@ class ProviderSettingRead(BaseModel):
         False,
         description="Whether the admin can switch live_sync_mode for this provider.",
     )
+    data_granularity: DataGranularity | None = Field(
+        None,
+        description="How finely 24/7 data is stored ('daily', 'hourly', 'raw'). Null = provider default.",
+    )
 
 
 class ProviderSettingUpdate(BaseModel):
@@ -32,6 +41,7 @@ class ProviderSettingUpdate(BaseModel):
 
     is_enabled: bool | None = None
     live_sync_mode: LiveSyncMode | None = None
+    data_granularity: DataGranularity | None = None
 
     @field_validator("live_sync_mode", mode="before")
     @classmethod

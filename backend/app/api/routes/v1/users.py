@@ -6,17 +6,25 @@ from fastapi import APIRouter, Query, status
 from app.database import DbSession
 from app.schemas.model_crud.user_management import (
     UserCreate,
+    UserDetailRead,
+    UserInclude,
     UserQueryParams,
     UserRead,
     UserUpdate,
 )
 from app.schemas.utils import OldPaginatedResponse
-from app.services import ApiKeyDep, DeveloperDep, user_service
+from app.services import ApiKeyDep, user_service
+from app.utils.problem import problem_doc
 
 router = APIRouter()
 
 
-@router.get("/users", response_model=OldPaginatedResponse[UserRead])
+@router.get(
+    "/users",
+    response_model=OldPaginatedResponse[UserRead],
+    # Keeps opt-in expansions out of the payload entirely rather than serializing them as null.
+    response_model_exclude_unset=True,
+)
 def list_users(
     db: DbSession,
     _api_key: ApiKeyDep,
@@ -35,30 +43,28 @@ def list_users(
 
 @router.get(
     "/users/{user_id}",
-    response_model=UserRead,
+    response_model=UserDetailRead,
+    # Same as the list: an expansion that was not asked for stays out of the payload.
+    response_model_exclude_unset=True,
     responses={
-        401: {
-            "description": "Authentication required",
-            "content": {
-                "application/json": {"example": {"detail": "Authentication required: provide JWT token or API key"}}
-            },
-        },
-        404: {
-            "description": "User not found",
-            "content": {
-                "application/json": {
-                    "example": {"detail": "User with ID: 123e4567-e89b-12d3-a456-426614174000 not found."}
-                }
-            },
-        },
-        400: {
-            "description": "Validation error",
-            "content": {"application/json": {"example": {"detail": "Input should be a valid UUID"}}},
-        },
+        **problem_doc(401, "Authentication required", "Authentication required: provide JWT token or API key"),
+        **problem_doc(404, "User not found", "User with ID: 123e4567-e89b-12d3-a456-426614174000 not found."),
     },
 )
-def get_user(user_id: UUID, db: DbSession, _api_key: ApiKeyDep):
-    return user_service.get(db, user_id, raise_404=True)
+def get_user(
+    user_id: UUID,
+    db: DbSession,
+    _api_key: ApiKeyDep,
+    include: Annotated[
+        list[UserInclude],
+        Query(
+            default_factory=list,
+            description="Optional expansions to embed; repeat the parameter for several",
+        ),
+    ],
+):
+    """Returns one user with its latest sync state and connection summary."""
+    return user_service.get_detail(db, user_id, include)
 
 
 @router.post("/users", status_code=status.HTTP_201_CREATED, response_model=UserRead)
@@ -77,5 +83,5 @@ def delete_user(user_id: UUID, db: DbSession, _api_key: ApiKeyDep):
 
 
 @router.patch("/users/{user_id}", response_model=UserRead)
-def update_user(user_id: UUID, payload: UserUpdate, db: DbSession, _developer: DeveloperDep):
+def update_user(user_id: UUID, payload: UserUpdate, db: DbSession, _api_key: ApiKeyDep):
     return user_service.update(db, user_id, payload, raise_404=True)

@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.schemas.model_crud.user_management import UserCreate, UserUpdate
 from app.services.user_service import user_service
+from app.utils.exceptions import ConflictError, NotFoundError
 from tests.factories import UserFactory
 
 
@@ -87,6 +88,15 @@ class TestUserServiceCreate:
         assert db_user is not None
         assert db_user.email == "persist@example.com"
 
+    def test_create_user_duplicate_email_returns_409(self, db: Session) -> None:
+        """Should raise 409 when registering with an already-used email."""
+        UserFactory(email="taken@example.com")
+
+        with pytest.raises(ConflictError) as exc_info:
+            user_service.create(db, UserCreate(email="taken@example.com"))
+
+        assert exc_info.value.status_code == 409
+
 
 class TestUserServiceUpdate:
     """Test user update with auto-set updated_at."""
@@ -136,15 +146,13 @@ class TestUserServiceUpdate:
         assert result is None
 
     def test_update_user_with_raise_404(self, db: Session) -> None:
-        """Should raise HTTPException(404) when updating non-existent user with raise_404=True."""
+        """Should raise NotFoundError when updating non-existent user with raise_404=True."""
         # Arrange
-        from fastapi import HTTPException
-
         fake_id = uuid4()
         update_payload = UserUpdate(email="new@example.com")
 
         # Act & Assert
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(NotFoundError) as exc_info:
             user_service.update(db, fake_id, update_payload, raise_404=True)
 
         assert exc_info.value.status_code == 404

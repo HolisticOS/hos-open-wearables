@@ -1,20 +1,33 @@
 """Tests for Garmin 247 data implementation."""
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
+from sqlalchemy import event as sa_event
 from sqlalchemy.orm import Session
 
+from app.models import DataSource, HealthScore, SeriesAggregate, SeriesSample, SleepDetails
 from app.repositories.data_point_series_repository import WriteCounts
+from app.repositories.event_record_detail_repository import EventRecordDetailRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.enums.series_types import SeriesType
+from app.schemas.enums import HealthScoreCategory
+from app.schemas.enums.series_types import SeriesType, get_series_type_id
+from app.schemas.model_crud.activities import CalendarPeriod
+from app.schemas.sync_status import SyncScope, SyncSource
 from app.services.providers.garmin.data_247 import Garmin247Data
+from app.services.providers.garmin.handlers.wellness import process_wellness_items
 from app.services.providers.garmin.oauth import GarminOAuth
+from app.utils.context import sync_run_var
+from app.utils.conversion import to_decimal
 from tests.factories import UserConnectionFactory, UserFactory
+
+# One day's stressDetails as Garmin sends it after midnight, and again in the morning with more data
+_AFTER_MIDNIGHT = {"startTimeInSeconds": 1705276800, "timeOffsetBodyBatteryValues": {"0": 20, "3600": 46}}
+_MORNING = {"startTimeInSeconds": 1705276800, "timeOffsetBodyBatteryValues": {"0": 20, "3600": 46, "25200": 78}}
 
 
 class TestGarmin247Data:
@@ -48,10 +61,6 @@ class TestGarmin247Data:
             "lightSleepDurationInSeconds": 14400,  # 4 hours
             "remSleepInSeconds": 5400,  # 1.5 hours
             "awakeDurationInSeconds": 1800,  # 30 minutes
-            "averageHeartRate": 58,
-            "lowestHeartRate": 48,
-            "respirationAvg": 14.5,
-            "avgOxygenSaturation": 96.5,
             "validation": "DEVICE",
         }
 
@@ -94,6 +103,27 @@ class TestGarmin247Data:
         }
 
     @pytest.fixture
+    def mixed_slot_epochs(self) -> list[dict[str, Any]]:
+        """One slot the user partly walked and partly sat through: one epoch per activity type."""
+        slot = {"startTimeInSeconds": 1705309200, "startTimeOffsetInSeconds": 3600, "durationInSeconds": 900}
+        return [
+            {
+                **slot,
+                "summaryId": "x1a2b3c-65a4f410-3",
+                "activityType": "WALKING",
+                "steps": 420,
+                "activeKilocalories": 18,
+            },
+            {
+                **slot,
+                "summaryId": "x1a2b3c-65a4f410-0",
+                "activityType": "SEDENTARY",
+                "steps": 0,
+                "activeKilocalories": 0,
+            },
+        ]
+
+    @pytest.fixture
     def sample_body_comp(self) -> dict[str, Any]:
         """Sample Garmin body composition data."""
         return {
@@ -103,6 +133,8 @@ class TestGarmin247Data:
             "bodyFatInPercent": 18.5,
             "bodyMassIndex": 23.5,
             "muscleMassInGrams": 35000,
+            "boneMassInGrams": 3100,
+            "bodyWaterInPercent": 56.4,
         }
 
     @pytest.fixture
@@ -208,11 +240,6 @@ class TestGarmin247Data:
         assert stages["rem_seconds"] == 5400
         assert stages["awake_seconds"] == 1800
 
-        # Heart rate and respiration
-        assert normalized["avg_heart_rate_bpm"] == 58
-        assert normalized["min_heart_rate_bpm"] == 48
-        assert normalized["avg_respiration"] == 14.5
-
     def test_extract_sleep_stages_from_map(self, garmin_247: Garmin247Data) -> None:
         """Sleep stage intervals are parsed, sorted, and typed correctly."""
         sleep_map = {
@@ -260,23 +287,93 @@ class TestGarmin247Data:
         assert actual_end == expected_end
         assert normalized["duration_seconds"] == 9000  # 7200 asleep + 1800 awake
 
+    def test_sleep_score_is_recorded_at_the_wake_up(
+        self, garmin_247: Garmin247Data, sample_sleep: dict[str, Any]
+    ) -> None:
+        # A night that starts before midnight UTC belongs to the day the user wakes up
+        sleep = {**sample_sleep, "startTimeOffsetInSeconds": 3600, "overallSleepScore": {"value": 84}}
+
+        _, score = garmin_247.normalize_sleep(sleep, uuid4())
+
+        assert score is not None
+        assert score.recorded_at == datetime(2024, 1, 15, 7, 0, tzinfo=timezone.utc)  # 23:00 UTC + 8 h
+        assert score.zone_offset == "+01:00"
+
     def test_normalize_sleep_missing_stages(self, garmin_247: Garmin247Data) -> None:
-        """Test normalizing sleep with missing stage data."""
+        """A manually entered sleep carries no stage fields, so the stages stay unreported."""
         user_id = uuid4()
         sleep_data = {
             "summaryId": "sleep_123",
             "startTimeInSeconds": 1705273200,
             "durationInSeconds": 28800,
+            "validation": "MANUAL",
         }
 
         normalized, _ = garmin_247.normalize_sleep(sleep_data, user_id)
+        result = garmin_247._build_sleep_record(user_id, normalized)
+        assert result is not None
+        _, detail = result
 
-        # Should handle missing stage data gracefully
-        stages = normalized["stages"]
-        assert stages["deep_seconds"] == 0
-        assert stages["light_seconds"] == 0
-        assert stages["rem_seconds"] == 0
-        assert stages["awake_seconds"] == 0
+        assert normalized["stages"] == {
+            "deep_seconds": None,
+            "light_seconds": None,
+            "rem_seconds": None,
+            "awake_seconds": None,
+        }
+        assert detail.sleep_deep_minutes is None
+        assert detail.sleep_light_minutes is None
+        assert detail.sleep_rem_minutes is None
+        assert detail.sleep_awake_minutes is None
+        assert detail.sleep_total_duration_minutes is None
+        assert detail.sleep_efficiency_score is None
+        assert detail.sleep_time_in_bed_minutes == 480
+
+    def test_build_sleep_record_keeps_reported_zero_stages(self, garmin_247: Garmin247Data) -> None:
+        """Devices without REM tracking report remSleepInSeconds=0, which is a real measurement."""
+        user_id = uuid4()
+        sleep_data = {
+            "summaryId": "sleep_123",
+            "startTimeInSeconds": 1705273200,
+            "durationInSeconds": 28800,
+            "validation": "AUTO_FINAL",
+            "deepSleepDurationInSeconds": 7200,
+            "lightSleepDurationInSeconds": 21600,
+            "remSleepInSeconds": 0,
+            "awakeDurationInSeconds": 0,
+        }
+
+        normalized, _ = garmin_247.normalize_sleep(sleep_data, user_id)
+        result = garmin_247._build_sleep_record(user_id, normalized)
+        assert result is not None
+        _, detail = result
+
+        assert detail.sleep_rem_minutes == 0
+        assert detail.sleep_awake_minutes == 0
+        assert detail.sleep_deep_minutes == 120
+        assert detail.sleep_total_duration_minutes == 480
+
+    def test_build_sleep_record_keeps_the_validation(self, garmin_247: Garmin247Data) -> None:
+        """A *_TENTATIVE night may still grow; the state is kept for is_final."""
+        sleep_data = {
+            "summaryId": "sleep_123",
+            "startTimeInSeconds": 1705273200,
+            "durationInSeconds": 28800,
+            "validation": "ENHANCED_TENTATIVE",
+        }
+
+        normalized, _ = garmin_247.normalize_sleep(sleep_data, uuid4())
+        result = garmin_247._build_sleep_record(uuid4(), normalized)
+
+        assert result is not None
+        assert result[1].provider_state == "ENHANCED_TENTATIVE"
+
+    def test_a_nap_keeps_its_sleep_summary_validation(self, garmin_247: Garmin247Data) -> None:
+        nap = {"napStartTimeInSeconds": 1705320000, "napDurationInSeconds": 1800, "napOffsetInSeconds": 3600}
+
+        result = garmin_247._build_nap_record(nap, uuid4(), "sleep_123", "ENHANCED_FINAL")
+
+        assert result is not None
+        assert result[1].provider_state == "ENHANCED_FINAL"
 
     # -------------------------------------------------------------------------
     # Dailies Data Tests
@@ -315,6 +412,34 @@ class TestGarmin247Data:
         assert normalized["steps"] is None
         assert normalized["active_calories"] is None
         assert normalized["resting_heart_rate"] is None
+        assert normalized["exercise_time"] is None
+
+    def test_normalize_dailies_exercise_time(self, garmin_247: Garmin247Data) -> None:
+        """Moderate and vigorous seconds are summed into whole exercise minutes."""
+        daily_data = {
+            "summaryId": "daily_123",
+            "calendarDate": "2024-01-15",
+            "startTimeInSeconds": 1705276800,
+            "moderateIntensityDurationInSeconds": 750,
+            "vigorousIntensityDurationInSeconds": 1710,
+        }
+
+        normalized, _ = garmin_247.normalize_dailies(daily_data, uuid4())
+
+        assert normalized["exercise_time"] == 41
+
+    def test_normalize_dailies_exercise_time_from_one_field(self, garmin_247: Garmin247Data) -> None:
+        """One intensity field alone still gives exercise minutes."""
+        daily_data = {
+            "summaryId": "daily_123",
+            "calendarDate": "2024-01-15",
+            "startTimeInSeconds": 1705276800,
+            "vigorousIntensityDurationInSeconds": 1680,
+        }
+
+        normalized, _ = garmin_247.normalize_dailies(daily_data, uuid4())
+
+        assert normalized["exercise_time"] == 28
 
     # -------------------------------------------------------------------------
     # Epochs Data Tests
@@ -362,38 +487,123 @@ class TestGarmin247Data:
         assert len(normalized["heart_rate"]) == 2
         assert len(normalized["steps"]) == 2
 
+    def test_normalize_epochs_sums_the_activity_types_of_a_slot(
+        self, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]]
+    ) -> None:
+        """A slot's steps and active energy are the sum over its activity types."""
+        normalized = garmin_247.normalize_epochs(mixed_slot_epochs, uuid4())
+
+        assert [sample["value"] for sample in normalized["steps"]] == [420]
+        assert [sample["value"] for sample in normalized["energy"]] == [18]
+
+    def test_normalize_epochs_counts_a_repeated_epoch_once(
+        self, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]]
+    ) -> None:
+        """A push can carry the same slot and activity type twice; the later one replaces the earlier."""
+        repeated = [*mixed_slot_epochs, {**mixed_slot_epochs[0], "steps": 450, "activeKilocalories": 19}]
+
+        normalized = garmin_247.normalize_epochs(repeated, uuid4())
+
+        assert [sample["value"] for sample in normalized["steps"]] == [450]
+        assert [sample["value"] for sample in normalized["energy"]] == [19]
+
+    def test_normalize_epochs_sums_a_slot_split_across_requests_of_a_push(
+        self, db: Session, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]]
+    ) -> None:
+        """Garmin splits a push into requests: the second one adds the slot's other activity type to the first."""
+        user_id = uuid4()
+        walking, sedentary = mixed_slot_epochs
+
+        garmin_247.normalize_epochs([walking], user_id, db)
+        normalized = garmin_247.normalize_epochs([sedentary], user_id, db)
+
+        assert [sample["value"] for sample in normalized["steps"]] == [420]
+        assert [sample["value"] for sample in normalized["energy"]] == [18]
+
+    def test_requests_of_a_push_lock_their_slots_in_one_order(
+        self, db: Session, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]]
+    ) -> None:
+        """Held to the commit, so a request writes its sum only after the earlier one committed its own."""
+        later = {**mixed_slot_epochs[0], "startTimeInSeconds": mixed_slot_epochs[0]["startTimeInSeconds"] + 900}
+        locked: list[str] = []
+
+        def capture(*args: Any) -> None:
+            if "pg_advisory_xact_lock" in args[2]:
+                locked.append(args[3]["key"])
+
+        sa_event.listen(db.get_bind(), "before_cursor_execute", capture)
+        try:
+            garmin_247.normalize_epochs([later, *mixed_slot_epochs], uuid4(), db)
+        finally:
+            sa_event.remove(db.get_bind(), "before_cursor_execute", capture)
+
+        assert len(locked) == 2
+        assert locked == sorted(locked)
+
+    def test_pulled_epochs_are_not_joined_with_pushed_ones(
+        self, db: Session, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]]
+    ) -> None:
+        """A pull returns every type of its range at once, so it replaces the slot like a later push does."""
+        user_id = uuid4()
+        walking, sedentary = mixed_slot_epochs
+        garmin_247.normalize_epochs([walking], user_id, db)
+
+        normalized = garmin_247.normalize_epochs([sedentary], user_id)
+
+        assert [sample["value"] for sample in normalized["steps"]] == [to_decimal(sedentary["steps"])]
+
+    def test_normalize_epochs_takes_the_slot_window_from_the_latest_epoch(
+        self, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]]
+    ) -> None:
+        """A repeated slot with another duration carries the window of the epoch whose value is stored."""
+        repeated = [*mixed_slot_epochs, {**mixed_slot_epochs[0], "durationInSeconds": 600, "steps": 450}]
+
+        normalized = garmin_247.normalize_epochs(repeated, uuid4())
+
+        assert [(sample["value"], sample["window_seconds"]) for sample in normalized["steps"]] == [(450, 600)]
+
+    @pytest.mark.parametrize(
+        "malformed",
+        [{"startTimeInSeconds": "not-a-timestamp"}, {"startTimeOffsetInSeconds": "n/a"}, {"summaryId": 12345}],
+    )
+    def test_normalize_epochs_skips_only_a_malformed_epoch(
+        self, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]], malformed: dict[str, Any]
+    ) -> None:
+        """A malformed epoch is dropped on its own; the push's other epochs are kept."""
+        broken = {**mixed_slot_epochs[0], "activityType": "RUNNING", "steps": 300, **malformed}
+
+        normalized = garmin_247.normalize_epochs([*mixed_slot_epochs, broken], uuid4())
+
+        assert [sample["value"] for sample in normalized["steps"]] == [420]
+
+    @patch("app.services.providers.garmin.data_247.logger")
+    def test_normalize_epochs_reports_skipped_epochs_once(
+        self, mock_logger: MagicMock, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]]
+    ) -> None:
+        """Malformed epochs are reported once per call, with how many were skipped."""
+        broken = [
+            {**mixed_slot_epochs[0], "summaryId": f"bad-{i}", "startTimeOffsetInSeconds": "n/a"} for i in range(3)
+        ]
+
+        garmin_247.normalize_epochs([*mixed_slot_epochs, *broken], uuid4())
+
+        mock_logger.error.assert_called_once()
+        assert mock_logger.error.call_args.kwargs["skipped"] == 3
+
+    def test_normalize_epochs_skips_a_non_numeric_metric(
+        self, garmin_247: Garmin247Data, mixed_slot_epochs: list[dict[str, Any]]
+    ) -> None:
+        """A non-numeric metric is left out of the slot's sum; the slot's other epochs still count."""
+        running = {**mixed_slot_epochs[0], "activityType": "RUNNING", "steps": "n/a", "activeKilocalories": 9}
+
+        normalized = garmin_247.normalize_epochs([*mixed_slot_epochs, running], uuid4())
+
+        assert [sample["value"] for sample in normalized["steps"]] == [420]
+        assert [sample["value"] for sample in normalized["energy"]] == [27]
+
     # -------------------------------------------------------------------------
     # Body Composition Tests
     # -------------------------------------------------------------------------
-
-    @patch("app.repositories.data_point_series_repository.DataPointSeriesRepository.bulk_create")
-    def test_save_body_composition(
-        self,
-        mock_bulk_create: MagicMock,
-        garmin_247: Garmin247Data,
-        db: Session,
-        sample_body_comp: dict[str, Any],
-    ) -> None:
-        """Test saving body composition data."""
-        user = UserFactory()
-        mock_bulk_create.side_effect = lambda db_session, samples: WriteCounts(len(samples), 0)
-
-        count = garmin_247.save_body_composition(db, user.id, sample_body_comp)
-
-        # Should create 4 data points: weight, body_fat, BMI, skeletal muscle mass
-        mock_bulk_create.assert_called_once()
-        assert len(mock_bulk_create.call_args[0][1]) == 4
-        assert count == 4
-
-    def test_save_body_composition_missing_timestamp(self, garmin_247: Garmin247Data, db: Session) -> None:
-        """Test saving body composition with missing timestamp."""
-        user_id = uuid4()
-        body_comp = {"summaryId": "bc_123", "weightInGrams": 75000}
-
-        count = garmin_247.save_body_composition(db, user_id, body_comp)
-
-        # Should return 0 if no timestamp
-        assert count == 0
 
     # -------------------------------------------------------------------------
     # Abstract Method Implementation Tests
@@ -424,9 +634,8 @@ class TestGarmin247Data:
 
         results = garmin_247.load_and_save_all(db, user.id)
 
-        assert results["sync_complete"] is True
-        assert results["total_saved"] == 0
-        assert "webhooks" in results["message"].lower()
+        assert results.rows_written == 0
+        assert not results.outcomes  # nothing attempted — data arrives by push
 
     def test_load_and_save_all_with_dates_is_noop(self, garmin_247: Garmin247Data, db: Session) -> None:
         """Test load_and_save_all with custom dates is still a no-op."""
@@ -437,8 +646,8 @@ class TestGarmin247Data:
 
         results = garmin_247.load_and_save_all(db, user.id, start_time=start, end_time=end)
 
-        assert results["sync_complete"] is True
-        assert results["total_saved"] == 0
+        assert results.rows_written == 0
+        assert not results.outcomes
 
     def test_load_and_save_all_string_dates_is_noop(self, garmin_247: Garmin247Data, db: Session) -> None:
         """Test load_and_save_all with ISO string dates is still a no-op."""
@@ -451,13 +660,14 @@ class TestGarmin247Data:
             end_time="2024-01-07T00:00:00Z",
         )
 
-        assert results["sync_complete"] is True
+        assert results.rows_written == 0
+        assert not results.all_failed
 
     # -------------------------------------------------------------------------
     # HRV Data Tests
     # -------------------------------------------------------------------------
 
-    def test_save_hrv_data(self, garmin_247: Garmin247Data, db: Session) -> None:
+    def test_process_items_batch_hrv(self, garmin_247: Garmin247Data, db: Session) -> None:
         """Test saving HRV data."""
         user = UserFactory()
         UserConnectionFactory(user=user, provider="garmin")
@@ -478,12 +688,13 @@ class TestGarmin247Data:
             },
         }
 
-        count = garmin_247.save_hrv_data(db, user.id, hrv_data)
+        count = garmin_247.process_items_batch(db, user.id, "hrv", [hrv_data])
 
-        # Should save 1 lastNightAvg + 3 hrvValues = 4 records
-        assert count == 4
+        # 3 hrvValues samples; lastNightAvg is the night's day value, kept in series_aggregate.
+        assert count == 3
+        assert [row.avg for row in db.query(SeriesAggregate)] == [Decimal("84")]
 
-    def test_save_hrv_data_missing_start_time(self, garmin_247: Garmin247Data, db: Session) -> None:
+    def test_process_items_batch_hrv_missing_start_time(self, garmin_247: Garmin247Data, db: Session) -> None:
         """Test saving HRV data with missing start time."""
         user = UserFactory()
         UserConnectionFactory(user=user, provider="garmin")
@@ -494,11 +705,11 @@ class TestGarmin247Data:
             # Missing startTimeInSeconds
         }
 
-        count = garmin_247.save_hrv_data(db, user.id, hrv_data)
+        count = garmin_247.process_items_batch(db, user.id, "hrv", [hrv_data])
 
         assert count == 0
 
-    def test_save_hrv_data_only_avg(self, garmin_247: Garmin247Data, db: Session) -> None:
+    def test_process_items_batch_hrv_only_avg(self, garmin_247: Garmin247Data, db: Session) -> None:
         """Test saving HRV data with only lastNightAvg."""
         user = UserFactory()
         UserConnectionFactory(user=user, provider="garmin")
@@ -512,10 +723,11 @@ class TestGarmin247Data:
             # No hrvValues
         }
 
-        count = garmin_247.save_hrv_data(db, user.id, hrv_data)
+        count = garmin_247.process_items_batch(db, user.id, "hrv", [hrv_data])
 
-        # Should save just the lastNightAvg
-        assert count == 1
+        # lastNightAvg alone: no sample, one day row.
+        assert count == 0
+        assert db.query(SeriesAggregate).count() == 1
 
     # -------------------------------------------------------------------------
     # Build Method Tests (no DB interaction)
@@ -527,9 +739,27 @@ class TestGarmin247Data:
         normalized, _ = garmin_247.normalize_dailies(sample_daily, user_id)
         samples = garmin_247._build_dailies_samples(user_id, normalized)
 
-        # 6 metrics (steps, calories, resting_hr, floors, distance, bmr) + 3 HR samples
+        # 6 metrics (steps, active/basal calories, resting_hr, floors, distance) + 3 HR samples
         assert len(samples) == 9
         assert len({s.series_type for s in samples}) > 1
+
+    def test_build_dailies_samples_exercise_time(self, garmin_247: Garmin247Data) -> None:
+        """Dailies emit exercise_time as a daily-total sample."""
+        user_id = uuid4()
+        daily_data = {
+            "summaryId": "daily_123",
+            "calendarDate": "2024-01-15",
+            "startTimeInSeconds": 1705276800,
+            "moderateIntensityDurationInSeconds": 720,
+            "vigorousIntensityDurationInSeconds": 1680,
+        }
+        normalized, _ = garmin_247.normalize_dailies(daily_data, user_id)
+
+        samples = garmin_247._build_dailies_samples(user_id, normalized)
+
+        exercise = [s for s in samples if s.series_type == SeriesType.exercise_time]
+        assert [s.value for s in exercise] == [Decimal("40")]
+        assert exercise[0].is_daily_total is True
 
     def test_build_dailies_samples_empty_on_missing_date(self, garmin_247: Garmin247Data) -> None:
         """Test _build_dailies_samples returns empty for missing date/timestamp."""
@@ -544,23 +774,105 @@ class TestGarmin247Data:
         normalized = garmin_247.normalize_epochs([sample_epoch], user_id)
         samples = garmin_247._build_epochs_samples(user_id, normalized)
 
-        # 1 heart_rate + 1 steps + 1 energy + 1 distance = 4
-        assert len(samples) == 4
+        # 1 heart_rate + 1 steps + 1 energy = 3
+        assert len(samples) == 3
+
+    def test_build_epochs_samples_carry_the_window(
+        self, garmin_247: Garmin247Data, sample_epoch: dict[str, Any]
+    ) -> None:
+        user_id = uuid4()
+        normalized = garmin_247.normalize_epochs([sample_epoch], user_id)
+
+        samples = garmin_247._build_epochs_samples(user_id, normalized)
+
+        assert {s.window_seconds for s in samples} == {900}
+
+    def test_build_epochs_samples_keep_an_epoch_reporting_no_duration(
+        self, garmin_247: Garmin247Data, sample_epoch: dict[str, Any]
+    ) -> None:
+        user_id = uuid4()
+        normalized = garmin_247.normalize_epochs([{**sample_epoch, "durationInSeconds": 0}], user_id)
+
+        samples = garmin_247._build_epochs_samples(user_id, normalized)
+
+        assert len(samples) == 3
+        assert {s.window_seconds for s in samples} == {None}
+
+    def test_build_dailies_samples_carry_the_whole_garmin_local_day(
+        self, garmin_247: Garmin247Data, sample_daily: dict[str, Any]
+    ) -> None:
+        user_id = uuid4()
+        mid_day_sync = {**sample_daily, "startTimeOffsetInSeconds": 3600, "durationInSeconds": 50400}
+        normalized, _ = garmin_247.normalize_dailies(mid_day_sync, user_id)
+
+        samples = garmin_247._build_dailies_samples(user_id, normalized)
+
+        day = CalendarPeriod.local_day(datetime(2024, 1, 15, tzinfo=timezone.utc), 86400, "+01:00")
+        assert {s.period for s in samples if s.series_type != SeriesType.heart_rate} == {day}
+        assert {s.period for s in samples if s.series_type == SeriesType.heart_rate} == {None}
+
+    def test_build_dailies_samples_without_start_time_keep_the_date(self, garmin_247: Garmin247Data) -> None:
+        user_id = uuid4()
+        normalized, _ = garmin_247.normalize_dailies({"calendarDate": "2024-01-15", "steps": 100}, user_id)
+
+        samples = garmin_247._build_dailies_samples(user_id, normalized)
+
+        assert [s.period for s in samples] == [CalendarPeriod.of_date(date(2024, 1, 15))]
+
+    def test_process_items_batch_dailies_mirrors_the_day_values(
+        self, db: Session, garmin_247: Garmin247Data, sample_daily: dict[str, Any]
+    ) -> None:
+        user = UserFactory()
+
+        garmin_247.process_items_batch(db, user.id, "dailies", [sample_daily])
+
+        # steps, active and basal energy, resting HR, floors, distance; intraday HR stays a sample only
+        assert db.query(SeriesAggregate).count() == 6
 
     def test_build_body_comp_samples(self, garmin_247: Garmin247Data, sample_body_comp: dict[str, Any]) -> None:
         """Test _build_body_comp_samples returns samples without DB call."""
         user_id = uuid4()
         samples = garmin_247._build_body_comp_samples(user_id, sample_body_comp)
-        assert len(samples) == 4  # weight, body_fat, BMI, skeletal muscle mass
+        assert len(samples) == 6  # weight, body_fat, BMI, skeletal muscle mass, bone mass, body water
 
-        muscle = next(s for s in samples if s.series_type == SeriesType.skeletal_muscle_mass)
-        assert muscle.value == Decimal("35")  # 35000 g -> 35 kg
+        by_type = {s.series_type: s for s in samples}
+        assert by_type[SeriesType.skeletal_muscle_mass].value == Decimal("35")  # 35000 g -> 35 kg
+        assert by_type[SeriesType.bone_mass].value == Decimal("3.1")  # 3100 g -> 3.1 kg
+        assert by_type[SeriesType.body_water_percentage].value == Decimal("56.4")
 
     def test_build_body_comp_samples_missing_timestamp(self, garmin_247: Garmin247Data) -> None:
         """Test _build_body_comp_samples returns empty for missing timestamp."""
         user_id = uuid4()
         samples = garmin_247._build_body_comp_samples(user_id, {"weightInGrams": 75000})
         assert samples == []
+
+    @patch("app.repositories.data_point_series_repository.DataPointSeriesRepository.bulk_create")
+    def test_process_items_batch_body_comp(
+        self,
+        mock_bulk_create: MagicMock,
+        garmin_247: Garmin247Data,
+        db: Session,
+        sample_body_comp: dict[str, Any],
+    ) -> None:
+        """Test body composition is persisted through the batch entrypoint."""
+        user = UserFactory()
+        mock_bulk_create.side_effect = lambda db_session, samples: WriteCounts(len(samples), 0)
+
+        count = garmin_247.process_items_batch(db, user.id, "bodyComps", [sample_body_comp])
+
+        # Should create 6 data points: weight, body_fat, BMI, skeletal muscle mass, bone mass, body water
+        mock_bulk_create.assert_called_once()
+        assert len(mock_bulk_create.call_args[0][1]) == 6
+        assert count == 6
+
+    def test_process_items_batch_body_comp_missing_timestamp(self, garmin_247: Garmin247Data, db: Session) -> None:
+        """Test a body composition item without a timestamp writes nothing."""
+        user = UserFactory()
+        body_comp = {"summaryId": "bc_123", "weightInGrams": 75000}
+
+        count = garmin_247.process_items_batch(db, user.id, "bodyComps", [body_comp])
+
+        assert count == 0
 
     def test_build_blood_pressure_samples(
         self, garmin_247: Garmin247Data, sample_blood_pressure: dict[str, Any]
@@ -569,9 +881,8 @@ class TestGarmin247Data:
         user_id = uuid4()
         samples = garmin_247._build_blood_pressure_samples(user_id, sample_blood_pressure)
 
-        assert len(samples) == 3  # systolic + diastolic + pulse
+        assert len(samples) == 3  # systolic + diastolic + pulse as heart rate (HOS fork)
         by_type = {s.series_type: s for s in samples}
-        assert by_type[SeriesType.heart_rate].value == Decimal("69")
         assert by_type[SeriesType.blood_pressure_systolic].value == Decimal("112")
         assert by_type[SeriesType.blood_pressure_diastolic].value == Decimal("73")
 
@@ -609,6 +920,32 @@ class TestGarmin247Data:
         samples = garmin_247._build_stress_samples(user_id, stress_data)
         assert len(samples) == 4  # 2 stress + 2 battery
 
+    # Webhook pushes and backfills both go through process_items_batch
+    def test_a_later_push_of_the_day_raises_the_body_battery_peak(self, garmin_247: Garmin247Data, db: Session) -> None:
+        user = UserFactory()
+
+        garmin_247.process_items_batch(db, user.id, "stressDetails", [_AFTER_MIDNIGHT])
+        garmin_247.process_items_batch(db, user.id, "stressDetails", [_MORNING])
+
+        assert self._body_battery_peaks(db, user.id) == [Decimal("78")]
+
+    def test_an_earlier_push_arriving_last_keeps_the_body_battery_peak(
+        self, garmin_247: Garmin247Data, db: Session
+    ) -> None:
+        user = UserFactory()
+
+        garmin_247.process_items_batch(db, user.id, "stressDetails", [_MORNING])
+        garmin_247.process_items_batch(db, user.id, "stressDetails", [_AFTER_MIDNIGHT])
+
+        assert self._body_battery_peaks(db, user.id) == [Decimal("78")]
+
+    @staticmethod
+    def _body_battery_peaks(db: Session, user_id: UUID) -> list[Decimal]:
+        scores = db.query(HealthScore).filter(
+            HealthScore.user_id == user_id, HealthScore.category == HealthScoreCategory.BODY_BATTERY
+        )
+        return [score.value for score in scores]
+
     def test_build_respiration_samples_webhook_field(self, garmin_247: Garmin247Data) -> None:
         """allDayRespiration webhook payload uses timeOffsetEpochToBreaths."""
         user_id = uuid4()
@@ -638,6 +975,20 @@ class TestGarmin247Data:
         assert record.category == "sleep"
         assert record.type == "sleep_session"
         assert detail.sleep_deep_minutes == 120  # 7200 / 60
+
+    def test_build_sleep_detail_orm_object(self, garmin_247: Garmin247Data, sample_sleep: dict[str, Any]) -> None:
+        """Regression test for #1135: real Garmin sleep payloads (no heart rate fields -
+        Garmin's ClientSleep schema doesn't expose them) must build a SleepDetails ORM
+        object without TypeError."""
+        user_id = uuid4()
+        normalized, _ = garmin_247.normalize_sleep(sample_sleep, user_id)
+        result = garmin_247._build_sleep_record(user_id, normalized)
+        assert result is not None
+        _, detail = result
+
+        repo = EventRecordDetailRepository.__new__(EventRecordDetailRepository)
+        orm_detail = repo._build_detail(detail, "sleep")
+        assert isinstance(orm_detail, SleepDetails)
 
     def test_build_activity_record(self, garmin_247: Garmin247Data) -> None:
         """Test _build_activity_record returns record + detail without DB call."""
@@ -707,6 +1058,24 @@ class TestGarmin247Data:
         mock_bulk_create.assert_called_once()
         assert count > 0
 
+    def test_process_items_batch_epochs_stores_the_slot_sum(
+        self, garmin_247: Garmin247Data, db: Session, mixed_slot_epochs: list[dict[str, Any]]
+    ) -> None:
+        """The epochs of one push are summed per slot instead of the last activity type overwriting the others."""
+        user = UserFactory()
+
+        garmin_247.process_items_batch(db, user.id, "epochs", mixed_slot_epochs)
+
+        stored = (
+            db.query(SeriesSample.series_type_definition_id, SeriesSample.value)
+            .join(DataSource, DataSource.id == SeriesSample.data_source_id)
+            .filter(DataSource.user_id == user.id)
+            .all()
+        )
+        assert sorted((type_id, float(value)) for type_id, value in stored) == sorted(
+            [(get_series_type_id(SeriesType.steps), 420.0), (get_series_type_id(SeriesType.active_energy), 18.0)]
+        )
+
     @patch("app.repositories.data_point_series_repository.DataPointSeriesRepository.bulk_create")
     def test_process_items_batch_stress(
         self,
@@ -751,6 +1120,114 @@ class TestGarmin247Data:
         mock_bulk_details.assert_called_once()
         assert count == 2
 
+    def test_normalize_sleep_includes_naps(self, garmin_247: Garmin247Data) -> None:
+        """normalize_sleep passes through the naps list and sets is_nap=False."""
+        user_id = uuid4()
+        raw = {
+            "summaryId": "sleep_with_nap",
+            "startTimeInSeconds": 1705273200,
+            "durationInSeconds": 28800,
+            "naps": [
+                {
+                    "napDurationInSeconds": 600,
+                    "napStartTimeInSeconds": 1690916700,
+                    "napValidation": "DEVICE",
+                    "napOffsetInSeconds": -18000,
+                }
+            ],
+        }
+        normalized, _ = garmin_247.normalize_sleep(raw, user_id)
+        assert normalized["is_nap"] is False
+        assert len(normalized["naps"]) == 1
+
+    def test_build_nap_record(self, garmin_247: Garmin247Data) -> None:
+        """_build_nap_record returns a record+detail with is_nap=True and correct fields."""
+        user_id = uuid4()
+        nap = {
+            "napDurationInSeconds": 600,
+            "napStartTimeInSeconds": 1690916700,
+            "napValidation": "DEVICE",
+            "napOffsetInSeconds": -18000,
+        }
+        result = garmin_247._build_nap_record(nap, user_id, parent_summary_id="sleep_123")
+        assert result is not None
+        record, detail = result
+        assert record.external_id == "sleep_123"
+        assert record.duration_seconds == 600
+        assert detail.is_nap is True
+        assert detail.sleep_total_duration_minutes == 10  # 600 // 60
+
+    def test_build_nap_record_missing_fields_returns_none(self, garmin_247: Garmin247Data) -> None:
+        """_build_nap_record returns None when start time or duration is missing."""
+        user_id = uuid4()
+        assert garmin_247._build_nap_record({}, user_id) is None
+        assert garmin_247._build_nap_record({"napDurationInSeconds": 600}, user_id) is None
+        assert garmin_247._build_nap_record({"napStartTimeInSeconds": 1690916700}, user_id) is None
+
+    @patch("app.services.event_record_service.event_record_service.bulk_create")
+    @patch("app.services.event_record_service.event_record_service.bulk_create_details")
+    def test_process_items_batch_sleeps_with_naps(
+        self,
+        mock_bulk_details: MagicMock,
+        mock_bulk_create: MagicMock,
+        garmin_247: Garmin247Data,
+        db: Session,
+        sample_sleep: dict[str, Any],
+    ) -> None:
+        """Naps embedded in a sleep summary are saved as separate is_nap=True records."""
+        user = UserFactory()
+        sleep_with_nap = {
+            **sample_sleep,
+            "naps": [
+                {
+                    "napDurationInSeconds": 600,
+                    "napStartTimeInSeconds": 1690916700,
+                    "napValidation": "DEVICE",
+                    "napOffsetInSeconds": -18000,
+                }
+            ],
+        }
+        mock_bulk_create.side_effect = lambda db_session, records: [r.id for r in records]
+
+        count = garmin_247.process_items_batch(db, user.id, "sleeps", [sleep_with_nap])
+
+        # 1 main sleep + 1 nap
+        assert count == 2
+        all_records = mock_bulk_create.call_args[0][1]
+        assert len(all_records) == 2
+
+    def test_skin_temp_deviation_becomes_a_sample(self, garmin_247: Garmin247Data) -> None:
+        # The skinTemp payload carries a deviation from baseline, never an absolute reading.
+        raw = {
+            "summaryId": "x60a3665-6abad64b",
+            "calendarDate": "2026-09-29",
+            "avgDeviationCelsius": -0.1,
+            "durationInSeconds": 31200,
+            "startTimeInSeconds": 1790629451,
+            "startTimeOffsetInSeconds": 7200,
+        }
+
+        samples = garmin_247._build_skin_temp_samples(uuid4(), raw)
+
+        assert [sample.series_type for sample in samples] == [SeriesType.skin_temperature_deviation]
+        assert float(samples[0].value) == -0.1
+        assert samples[0].external_id == "x60a3665-6abad64b"
+
+    def test_a_night_measured_before_midnight_keeps_garmins_own_day(self, garmin_247: Garmin247Data) -> None:
+        # Measurement starts at 23:02 local on the 23rd; Garmin calls that night the 24th.
+        raw = {
+            "summaryId": "x60a3665-late",
+            "calendarDate": "2026-09-24",
+            "avgDeviationCelsius": 0.3,
+            "durationInSeconds": 25200,
+            "startTimeInSeconds": 1790197320,
+            "startTimeOffsetInSeconds": 7200,
+        }
+
+        samples = garmin_247._build_skin_temp_samples(uuid4(), raw)
+
+        assert samples[0].recorded_at.date().isoformat() == "2026-09-24"
+
     def test_process_items_batch_empty(self, garmin_247: Garmin247Data, db: Session) -> None:
         """Test batch processing empty items returns 0."""
         user = UserFactory()
@@ -776,3 +1253,22 @@ class TestGarmin247Data:
 
         mock_bulk_create.assert_called_once()
         assert count == 1
+
+
+class TestWellnessPushRun:
+    def test_push_is_written_under_the_run_it_reports(self) -> None:
+        connection = MagicMock(user_id=uuid4())
+        connection_repo = MagicMock()
+        connection_repo.get_all_by_provider_user_id.return_value = [connection]
+        written_under = []
+        garmin_247 = MagicMock()
+        garmin_247.process_items_batch.side_effect = lambda *_args: written_under.append(sync_run_var.get()) or 1
+
+        with patch("app.services.providers.garmin.handlers.wellness.emit_sync_completed") as completed:
+            process_wellness_items(
+                MagicMock(), connection_repo, garmin_247, "dailies", [{"userId": "g1"}], [], set(), "trace"
+            )
+
+        assert written_under[0].run_id == completed.call_args.kwargs["run_id"]
+        assert (written_under[0].source, written_under[0].scope) == (SyncSource.WEBHOOK, SyncScope.LIVE)
+        assert sync_run_var.get() is None

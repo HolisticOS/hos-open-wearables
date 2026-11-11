@@ -33,7 +33,7 @@ APP_DEEP_LINK = "myapp://providers/connected?provider=garmin"
 
 @pytest.fixture
 def auth_headers(db: Session) -> dict[str, str]:
-    return api_key_headers(ApiKeyFactory().id)
+    return api_key_headers(ApiKeyFactory().plain_key)
 
 
 @pytest.fixture
@@ -189,7 +189,8 @@ class TestOAuthAuthorizeEndpoint:
         """Test authorization without user_id parameter."""
         response = client.get("/api/v1/oauth/garmin/authorize", headers=auth_headers)
 
-        assert response.status_code == 400
+        # Assert
+        assert response.status_code == 422
 
     def test_authorize_invalid_user_id(self, client: TestClient, auth_headers: dict[str, str]) -> None:
         """Test authorization with invalid user_id format."""
@@ -199,7 +200,8 @@ class TestOAuthAuthorizeEndpoint:
             headers=auth_headers,
         )
 
-        assert response.status_code == 400
+        # Assert
+        assert response.status_code == 422
 
     def test_authorize_invalid_provider(self, client: TestClient, user: User, auth_headers: dict[str, str]) -> None:
         """Test authorization with non-existent provider."""
@@ -209,7 +211,8 @@ class TestOAuthAuthorizeEndpoint:
             headers=auth_headers,
         )
 
-        assert response.status_code == 400
+        # Assert
+        assert response.status_code == 422
 
     def test_authorize_non_oauth_provider(self, client: TestClient, user: User, auth_headers: dict[str, str]) -> None:
         """Test authorization with provider that doesn't support OAuth."""
@@ -221,7 +224,8 @@ class TestOAuthAuthorizeEndpoint:
         )
 
         # Assert - Should fail because apple doesn't have OAuth
-        assert response.status_code in [400, 401, 422]
+        assert response.status_code == 400
+        assert response.json()["code"] == "UNSUPPORTED_PROVIDER"
 
 
 def _put_state(user_id: UUID, redirect_uri: str | None, provider: str = "garmin") -> str:
@@ -446,7 +450,7 @@ class TestOAuthCallbackHistoricalSync:
             )
         assert response.status_code == 303
 
-    @patch("app.integrations.celery.tasks.start_garmin_full_backfill")
+    @patch("app.api.routes.v1.oauth.start_garmin_full_backfill")
     def test_garmin_backfill_runs_by_default(self, backfill: MagicMock, client: TestClient, user: User) -> None:
         with (
             patch.object(settings, "historical_sync_on_connect", True),
@@ -454,9 +458,9 @@ class TestOAuthCallbackHistoricalSync:
         ):
             self._connect(client, user, "garmin")
 
-        backfill.delay.assert_called_once_with(str(user.id))
+        backfill.delay.assert_called_once_with(str(user.id), None)
 
-    @patch("app.integrations.celery.tasks.start_garmin_full_backfill")
+    @patch("app.api.routes.v1.oauth.start_garmin_full_backfill")
     def test_garmin_backfill_skipped_when_disabled_for_garmin(
         self, backfill: MagicMock, client: TestClient, user: User
     ) -> None:
@@ -468,7 +472,7 @@ class TestOAuthCallbackHistoricalSync:
 
         backfill.delay.assert_not_called()
 
-    @patch("app.integrations.celery.tasks.sync_vendor_data")
+    @patch("app.api.routes.v1.oauth.sync_vendor_data")
     def test_other_providers_keep_backfill_when_garmin_disabled(
         self, sync: MagicMock, client: TestClient, user: User
     ) -> None:
@@ -482,7 +486,7 @@ class TestOAuthCallbackHistoricalSync:
         assert sync.delay.call_args.kwargs["providers"] == ["polar"]
         assert sync.delay.call_args.kwargs["is_historical"] is True
 
-    @patch("app.integrations.celery.tasks.start_garmin_full_backfill")
+    @patch("app.api.routes.v1.oauth.start_garmin_full_backfill")
     def test_global_flag_off_still_disables_all(self, backfill: MagicMock, client: TestClient, user: User) -> None:
         with (
             patch.object(settings, "historical_sync_on_connect", False),
@@ -791,6 +795,7 @@ class TestOAuthUpdateProviderEndpoint:
 
         # Assert
         assert response.status_code == 400
+        assert response.json()["code"] == "BAD_REQUEST"
 
     def test_update_live_sync_mode_non_configurable_provider(
         self,
@@ -814,6 +819,7 @@ class TestOAuthUpdateProviderEndpoint:
 
         # Assert
         assert response.status_code == 400
+        assert response.json()["code"] == "UNSUPPORTED_PROVIDER"
 
     def test_update_provider_response_structure(
         self,
@@ -868,3 +874,16 @@ class TestOAuthUpdateProviderEndpoint:
             data = response.json()
             assert data["provider"] == provider
             assert data["is_enabled"] is True
+
+
+class TestOAuthCallbackProbe:
+    """Providers such as Withings send HEAD to the callback URL when it is registered."""
+
+    def test_head_callback_returns_ok_without_body(self, client: TestClient, db: Session) -> None:
+        response = client.head("/api/v1/oauth/withings/callback")
+        assert response.status_code == 200
+        assert response.content == b""
+
+    def test_head_callback_invalid_provider(self, client: TestClient, db: Session) -> None:
+        response = client.head("/api/v1/oauth/not-a-provider/callback")
+        assert response.status_code == 422

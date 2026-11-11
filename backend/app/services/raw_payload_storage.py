@@ -13,15 +13,17 @@ Usage (one-liner at ingestion point):
 """
 
 import json
-import logging
 import sys
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from app.utils.structured_logging import json_serial, log_structured
+import sentry_sdk
 
-logger = logging.getLogger(__name__)
+from app.services.s3_client import create_s3_client
+from app.utils.structured_logging import get_logger, json_serial
+
+logger = get_logger(__name__)
 
 _storage_backend: str = "disabled"
 _max_size_bytes: int = 10 * 1024 * 1024  # 10 MB
@@ -38,6 +40,7 @@ def configure(
     s3_prefix: str = "raw-payloads",
     s3_endpoint_url: str | None = None,
     fit_files_enabled: bool = False,
+    transport_enabled: bool = False,
 ) -> None:
     """Called once at startup from settings."""
     global _storage_backend, _max_size_bytes, _s3_bucket, _s3_prefix, _s3_client, _fit_files_enabled
@@ -46,42 +49,26 @@ def configure(
     _s3_prefix = s3_prefix
     _fit_files_enabled = False
 
-    if storage_backend == "s3" or fit_files_enabled:
+    if storage_backend == "s3" or fit_files_enabled or transport_enabled:
         _s3_bucket = s3_bucket
         if not _s3_bucket:
-            logger.error("S3 storage requested but no S3 bucket configured")
+            logger.error("S3 storage requested but no S3 bucket configured", alert=True)
             _storage_backend = "disabled"
             return
         _s3_client = _create_s3_client(endpoint_url=s3_endpoint_url)
         if _s3_client is None:
-            logger.error("Failed to create S3 client - raw payload storage disabled")
+            logger.error("Failed to create S3 client - raw payload storage disabled", alert=True)
             _storage_backend = "disabled"
             return
         if storage_backend != "s3":
-            # Client created solely for FIT file storage
+            # Client created solely for FIT file storage / payload transport
             _storage_backend = "disabled"
         _fit_files_enabled = fit_files_enabled
 
 
 def _create_s3_client(endpoint_url: str | None = None) -> Any:
-    """Create a boto3 S3 client using app AWS settings."""
-    try:
-        import boto3
-        from botocore.exceptions import NoCredentialsError
-
-        from app.config import settings
-
-        kwargs: dict[str, Any] = {"region_name": settings.aws_region}
-        if settings.aws_access_key_id and settings.aws_secret_access_key:
-            kwargs["aws_access_key_id"] = settings.aws_access_key_id
-            kwargs["aws_secret_access_key"] = settings.aws_secret_access_key.get_secret_value()
-        if endpoint_url:
-            kwargs["endpoint_url"] = endpoint_url
-
-        return boto3.client("s3", **kwargs)
-    except (NoCredentialsError, AttributeError, Exception) as e:
-        logger.error("Cannot create S3 client for raw payload storage: %s", e)
-        return None
+    """Create a boto3 S3 client using app AWS settings (shared factory)."""
+    return create_s3_client(endpoint_url)
 
 
 def store_raw_payload(
@@ -92,7 +79,7 @@ def store_raw_payload(
     user_id: str | None = None,
     trace_id: str | None = None,
 ) -> None:
-    """Store a raw payload. No-op when disabled.
+    """Store a raw payload for debugging. No-op when disabled.
 
     Args:
         source: Origin type - "sdk", "webhook", or "api_response"
@@ -110,16 +97,75 @@ def store_raw_payload(
     size = len(payload_str.encode("utf-8"))
     if size > _max_size_bytes:
         logger.warning(
-            "Raw payload skipped (size %d bytes exceeds limit %d)",
-            size,
-            _max_size_bytes,
+            "Raw payload skipped (size exceeds limit)",
+            provider=provider,
+            source=source,
+            size_bytes=size,
+            max_size_bytes=_max_size_bytes,
         )
         return
 
+    ref = None
     if _storage_backend == "log":
         _store_to_log(source, provider, payload_str, size, user_id, trace_id)
     elif _storage_backend == "s3":
-        _store_to_s3(source, provider, payload_str, size, user_id, trace_id)
+        ref = put_payload_to_s3(
+            source=source, provider=provider, payload=payload_str, user_id=user_id, trace_id=trace_id
+        )
+
+    if _storage_backend == "s3" and ref is None:
+        return  # upload failed - there is nothing to point at
+
+    # Point any Sentry error later in this request/task at the stored payload - the
+    # reference only, never the content.
+    sentry_sdk.add_breadcrumb(
+        category="raw_payload",
+        message=f"Raw payload stored ({_storage_backend})",
+        data={"ref": ref, "source": source, "provider": provider, "trace_id": trace_id, "size_bytes": size},
+    )
+
+
+def get_payload_from_s3(ref: str) -> str:
+    """Read a payload back from an ``s3://bucket/key`` reference.
+
+    Raises on any read failure; the caller decides whether to retry the task.
+    """
+    if _s3_client is None:
+        raise RuntimeError("Cannot get payload: S3 client not configured")
+    bucket, key = _split_ref(ref)
+    obj = _s3_client.get_object(Bucket=bucket, Key=key)
+    return obj["Body"].read().decode("utf-8")
+
+
+def delete_payload_from_s3(ref: str) -> None:
+    """Delete a payload by ``s3://bucket/key`` reference. Best-effort - never raises.
+
+    Drops a transport-only copy once the data is persisted, so a deployment that opted out
+    of payload archival does not accumulate them. Needs ``s3:DeleteObject``.
+    """
+    if _s3_client is None:
+        return
+    try:
+        bucket, key = _split_ref(ref)
+        _s3_client.delete_object(Bucket=bucket, Key=key)
+    except Exception as e:
+        logger.error("Failed to delete payload from S3", exc_info=e, ref=ref)
+
+
+def _split_ref(ref: str) -> tuple[str, str]:
+    """Split ``s3://bucket/key``.
+
+    The bucket travels in the reference because app/worker config drift would otherwise
+    turn into a silent 404 on a payload that was written just fine.
+    """
+    if not ref.startswith("s3://"):
+        # A bare key would split into a bucket named after our own prefix, reading from
+        # someone else's bucket without a word of complaint.
+        raise ValueError(f"Payload reference must be an s3:// URI: {ref}")
+    bucket, _, key = ref[len("s3://") :].partition("/")
+    if not bucket or not key:
+        raise ValueError(f"Malformed S3 payload reference: {ref}")
+    return bucket, key
 
 
 def _store_to_log(
@@ -146,23 +192,26 @@ def _store_to_log(
     print(json.dumps(entry), file=sys.stdout, flush=True)
 
 
-def _store_to_s3(
+def put_payload_to_s3(
+    *,
     source: str,
     provider: str,
-    payload_str: str,
-    size: int,
-    user_id: str | None,
-    trace_id: str | None,
-) -> None:
-    """Upload raw payload to S3.
+    payload: str,
+    user_id: str | None = None,
+    trace_id: str | None = None,
+) -> str | None:
+    """Upload a serialized payload to S3 and return its ``s3://bucket/key`` reference.
 
-    Key format: {prefix}/{provider}/{source}/{YYYY-MM-DD}/{uuid}.json
+    Key format: {prefix}/{provider}/{source}/{YYYY-MM-DD}/{user_id}/{uuid}.json
     Metadata includes user_id, trace_id, and size for easy filtering.
+
+    Returns None on failure - a caller that needs the reference has to handle that.
     """
     if _s3_client is None or _s3_bucket is None:
-        logger.warning("S3 client or bucket not configured - skipping raw payload storage")
-        return
+        logger.warning("S3 client or bucket not configured - skipping payload upload")
+        return None
 
+    body = payload.encode("utf-8")
     now = datetime.now(UTC)
     date_part = now.strftime("%Y-%m-%d")
     file_id = uuid4().hex[:12]
@@ -172,7 +221,7 @@ def _store_to_s3(
     metadata: dict[str, str] = {
         "source": source,
         "provider": provider,
-        "size_bytes": str(size),
+        "size_bytes": str(len(body)),
         "timestamp": now.isoformat(),
     }
     if user_id:
@@ -184,18 +233,15 @@ def _store_to_s3(
         _s3_client.put_object(
             Bucket=_s3_bucket,
             Key=key,
-            Body=payload_str.encode("utf-8"),
+            Body=body,
             ContentType="application/json",
             Metadata=metadata,
         )
-        logger.debug(
-            "Stored raw payload to S3: s3://%s/%s (%d bytes)",
-            _s3_bucket,
-            key,
-            size,
-        )
-    except Exception:
-        logger.exception("Failed to store raw payload to S3: s3://%s/%s", _s3_bucket, key)
+        logger.debug("Stored payload to S3", bucket=_s3_bucket, key=key, size_bytes=len(body))
+        return f"s3://{_s3_bucket}/{key}"
+    except Exception as e:
+        logger.error("Failed to store payload to S3", exc_info=e, bucket=_s3_bucket, key=key)
+        return None
 
 
 def store_fit_file(
@@ -213,19 +259,21 @@ def store_fit_file(
     if not _fit_files_enabled:
         return
     if _s3_client is None or _s3_bucket is None:
-        log_structured(logger, "warning", "Cannot store FIT file — S3 not configured")
+        logger.warning("Cannot store FIT file — S3 not configured")
         return
 
     now = datetime.now(UTC)
     key = f"fit-files/{provider}/{now.strftime('%Y-%m-%d')}/{user_id}/{activity_id}.fit"
+    metadata = {"provider": provider, "user_id": user_id, "activity_id": str(activity_id)}
+
     try:
         _s3_client.put_object(
             Bucket=_s3_bucket,
             Key=key,
             Body=fit_bytes,
             ContentType="application/octet-stream",
-            Metadata={"provider": provider, "user_id": user_id, "activity_id": str(activity_id)},
+            Metadata=metadata,
         )
-        logger.debug("Stored FIT file to S3: s3://%s/%s (%d bytes)", _s3_bucket, key, len(fit_bytes))
+        logger.debug("Stored FIT file to S3", bucket=_s3_bucket, key=key, size_bytes=len(fit_bytes))
     except Exception:
-        log_structured(logger, "error", "Failed to store FIT file to S3", bucket=_s3_bucket, key=key)
+        logger.error("Failed to store FIT file to S3", bucket=_s3_bucket, key=key)

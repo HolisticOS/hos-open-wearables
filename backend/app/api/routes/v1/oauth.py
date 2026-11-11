@@ -1,5 +1,4 @@
-from datetime import datetime, timedelta, timezone
-from logging import getLogger
+from datetime import datetime, timezone
 from typing import Annotated
 from uuid import UUID
 
@@ -7,7 +6,9 @@ from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import RedirectResponse
 
 from app.config import settings
+from app.constants.provider_urls import from_url_slug
 from app.database import DbSession
+from app.integrations.celery.tasks import start_garmin_full_backfill, sync_vendor_data
 from app.schemas.enums import ProviderName
 from app.schemas.model_crud.credentials import AuthorizationURLResponse, OAuthState
 from app.schemas.model_crud.data_priority import (
@@ -16,18 +17,25 @@ from app.schemas.model_crud.data_priority import (
     ProviderSettingUpdate,
 )
 from app.services import ApiKeyDep, DeveloperDep, user_connection_service, user_service
-from app.services.provider_settings_service import ProviderSettingsService
+from app.services.provider_settings_service import provider_settings_service
 from app.services.providers.base_strategy import BaseProviderStrategy
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.templates.base_oauth import OAuthConnectionError
+from app.utils.exceptions import AppError, UnsupportedProviderError, unknown_provider
 from app.utils.oauth_redirect import add_query_params, is_allowed_redirect_uri, short_reason
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 router = APIRouter()
 factory = ProviderFactory()
-settings_service = ProviderSettingsService()
+
+
+def resolve_provider(slug: str) -> ProviderName:
+    try:
+        return ProviderName(from_url_slug(slug))
+    except ValueError:
+        raise unknown_provider(slug, ("path", "provider"), (p.value for p in ProviderName)) from None
 
 
 def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
@@ -35,22 +43,18 @@ def get_oauth_strategy(provider: ProviderName) -> BaseProviderStrategy:
     strategy = factory.get_provider(provider.value)
 
     if not strategy.oauth:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Provider '{provider.value}' does not support OAuth",
-        )
+        raise UnsupportedProviderError(provider.value, "OAuth")
     return strategy
 
 
 @router.get(
     "/{provider}/authorize",
     summary="Get Provider Authorization URL",
-    status_code=status.HTTP_200_OK,
     response_model=AuthorizationURLResponse,
     tags=["External: Providers"],
 )
 def authorize_provider(
-    provider: ProviderName,
+    provider: str,
     db: DbSession,
     _auth: ApiKeyDep,
     user_id: Annotated[UUID, Query(description="User ID to connect")],
@@ -70,7 +74,7 @@ def authorize_provider(
 
     Returns authorization URL where user should be redirected to log in.
     """
-    strategy = get_oauth_strategy(provider)
+    strategy = get_oauth_strategy(resolve_provider(provider))
 
     if redirect_uri is not None and not is_allowed_redirect_uri(redirect_uri):
         raise HTTPException(
@@ -84,9 +88,15 @@ def authorize_provider(
     return AuthorizationURLResponse(authorization_url=auth_url, state=state)
 
 
+@router.head("/{provider}/callback", tags=["System: OAuth"])
+def probe_oauth_callback(provider: str) -> None:
+    """Answer the reachability probe Withings sends when the callback URL is registered."""
+    get_oauth_strategy(resolve_provider(provider))
+
+
 @router.get("/{provider}/callback", tags=["System: OAuth"])
 def oauth_callback(
-    provider: ProviderName,
+    provider: str,
     db: DbSession,
     code: Annotated[str | None, Query(description="Authorization code from provider")] = None,
     state: Annotated[str | None, Query(description="State parameter for CSRF protection")] = None,
@@ -103,24 +113,25 @@ def oauth_callback(
     (with ``status=error&error=<reason>``). Without one, the internal
     success/error pages are used.
     """
-    strategy = get_oauth_strategy(provider)
+    provider_name = resolve_provider(provider)
+    strategy = get_oauth_strategy(provider_name)
     assert strategy.oauth
 
     # Consume the state up front so failures can still go back to the client's redirect_uri.
     oauth_state: OAuthState | None = None
     code_verifier: str | None = None
-    state_error: HTTPException | None = None
+    state_error: HTTPException | AppError | None = None
     if state:
         try:
             oauth_state, code_verifier = strategy.oauth.consume_state(state)
-        except HTTPException as e:
+        except (HTTPException, AppError) as e:
             state_error = e
 
     redirect_uri = oauth_state.redirect_uri if oauth_state else None
 
     if error:
         if redirect_uri:
-            return _error_redirect(redirect_uri, provider, short_reason(error, default="provider_error"))
+            return _error_redirect(redirect_uri, provider_name, short_reason(error, default="provider_error"))
         return RedirectResponse(
             url=f"/api/v1/oauth/error?message={error}:+{error_description or 'Unknown+error'}",
             status_code=303,
@@ -128,7 +139,7 @@ def oauth_callback(
 
     if not code or not state:
         if redirect_uri:
-            return _error_redirect(redirect_uri, provider, "missing_oauth_parameters")
+            return _error_redirect(redirect_uri, provider_name, "missing_oauth_parameters")
         return RedirectResponse(
             url="/api/v1/oauth/error?message=Missing+OAuth+parameters",
             status_code=303,
@@ -144,43 +155,42 @@ def oauth_callback(
         if not redirect_uri:
             raise
         reason = e.reason if isinstance(e, OAuthConnectionError) else "connection_failed"
-        log_structured(
-            logger,
-            "warning",
-            f"OAuth callback failed, sending user back to redirect_uri: {e}",
-            provider=provider.value,
+        logger.warning(
+            "OAuth callback failed, sending user back to redirect_uri",
+            error=str(e),
+            provider=provider_name.value,
             task="oauth_callback",
             user_id=str(oauth_state.user_id),
             reason=reason,
         )
-        return _error_redirect(redirect_uri, provider, reason)
+        return _error_redirect(redirect_uri, provider_name, reason)
 
     # Stamp last_synced_at=now so the first periodic sync uses the connection
     # timestamp as its live-sync cursor and won't attempt to pull all history.
-    user_connection_service.stamp_last_synced_at(db, oauth_state.user_id, provider.value)
+    previous_synced_at = user_connection_service.stamp_last_synced_at(db, oauth_state.user_id, provider_name.value)
 
     # Grace-period flag: automatically kick off a historical sync so integrators
     # who haven't yet adopted the explicit /sync/historical call still get backfill.
     # Controlled by HISTORICAL_SYNC_ON_CONNECT (default: true).
     # HISTORICAL_SYNC_DISABLED_PROVIDERS opts single providers out (e.g. a push-only
     # Garmin app without backfill access) while the others keep it.
-    if settings.historical_sync_on_connect and provider.value not in settings.historical_sync_disabled_providers:
+    if settings.historical_sync_on_connect and provider_name.value not in settings.historical_sync_disabled_providers:
         caps = strategy.capabilities
         if caps.webhook_callback:
-            # this code is going to be removed later, so leave inner imports heres
-            from app.integrations.celery.tasks import start_garmin_full_backfill
-
-            start_garmin_full_backfill.delay(str(oauth_state.user_id))
+            gap_start = user_connection_service.reconnect_gap_start(
+                db, oauth_state.user_id, provider_name.value, previous_synced_at
+            )
+            start_garmin_full_backfill.delay(str(oauth_state.user_id), gap_start.isoformat() if gap_start else None)
         elif caps.rest_pull:
-            from app.integrations.celery.tasks import sync_vendor_data
-
             now = datetime.now(timezone.utc)
-            start_date = (now - timedelta(days=90)).isoformat()
+            start_date = user_connection_service.historical_start_on_connect(
+                db, oauth_state.user_id, provider_name.value, previous_synced_at, days=90
+            )
             sync_vendor_data.delay(
                 user_id=str(oauth_state.user_id),
-                start_date=start_date,
+                start_date=start_date.isoformat(),
                 end_date=now.isoformat(),
-                providers=[provider.value],
+                providers=[provider_name.value],
                 is_historical=True,
             )
 
@@ -188,14 +198,14 @@ def oauth_callback(
     if oauth_state.redirect_uri:
         success_url = add_query_params(
             oauth_state.redirect_uri,
-            {"status": "success", "provider": provider.value},
+            {"status": "success", "provider": provider_name.value},
             override=False,
         )
         return RedirectResponse(url=success_url, status_code=303)
 
     # Otherwise, redirect to internal success page
     return RedirectResponse(
-        url=f"/api/v1/oauth/success?provider={provider.value}&user_id={oauth_state.user_id}",
+        url=f"/api/v1/oauth/success?provider={provider_name.value}&user_id={oauth_state.user_id}",
         status_code=303,
     )
 
@@ -247,7 +257,7 @@ def get_providers(
 
     Returns full provider details including name, icon_url, has_cloud_api, is_enabled.
     """
-    all_providers = settings_service.get_all_providers(db)
+    all_providers = provider_settings_service.get_all_providers(db)
 
     return [p for p in all_providers if (not enabled_only or p.is_enabled) and (not cloud_only or p.has_cloud_api)]
 
@@ -260,10 +270,7 @@ def update_provider_setting(
     _developer: DeveloperDep,
 ):
     """Update is_enabled and/or live_sync_mode for a single provider."""
-    try:
-        return settings_service.update_provider_setting(db, provider, update)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return provider_settings_service.update_provider_setting(db, provider, update)
 
 
 @router.put("/providers", response_model=list[ProviderSettingRead], tags=["Internal: Providers"])
@@ -278,4 +285,4 @@ def bulk_update_providers(
     Accepts a map of provider_id -> is_enabled and updates all providers at once.
     This is the primary endpoint for the admin UI to save checkbox states.
     """
-    return settings_service.bulk_update_providers(db, updates.providers)
+    return provider_settings_service.bulk_update_providers(db, updates.providers)

@@ -1,37 +1,47 @@
+from collections.abc import Sequence
 from datetime import datetime
-from logging import Logger, getLogger
 from uuid import UUID
 
 from pydantic import ValidationError
 
 from app.database import DbSession
+from app.integrations.celery.tasks.delete_user_webhook_payloads_task import delete_user_webhook_payloads
 from app.models import User
 from app.repositories.user_repository import UserRepository
 from app.schemas.auth import ConnectionStatus
 from app.schemas.model_crud.user_management import (
+    UserConnectionSummary,
     UserCreate,
     UserCreateInternal,
+    UserDetailRead,
+    UserInclude,
     UserQueryParams,
     UserRead,
     UserUpdate,
     UserUpdateInternal,
 )
 from app.schemas.utils import OldPaginatedResponse
+from app.services.outgoing_webhooks import svix as svix_service
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.garmin.backfill_state import force_release_backfill_lock
 from app.services.services import AppService
 from app.services.sync_coordination import release_stale_primary
 from app.services.user_connection_service import user_connection_service
-from app.utils.exceptions import handle_exceptions
-from app.utils.structured_logging import log_structured
+from app.utils.exceptions import ConflictError, ResourceNotFoundError
+from app.utils.structured_logging import get_logger
+
+logger = get_logger(__name__)
+
+# Delay before deleting the webhook payloads of a deleted user, covering emit tasks already
+# queued (emit_webhook_event retries twice, 5 s apart).
+_WEBHOOK_PAYLOAD_DELETION_COUNTDOWN_SECONDS = 60
 
 
 class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdateInternal]):
-    def __init__(self, log: Logger, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(
             crud_model=UserRepository,
             model=User,
-            log=log,
             **kwargs,
         )
 
@@ -39,11 +49,21 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
         """Get count of users created within a date range."""
         return self.crud.get_count_in_range(db_session, start_date, end_date)
 
-    def create(self, db_session: DbSession, creator: UserCreate) -> User:
+    def create(self, db_session: DbSession, creator: UserCreate, *, is_seed: bool = False) -> User:
         """Create a user with server-generated id and created_at."""
+        if self.crud.get_by_email(db_session, creator.email):
+            raise ConflictError("User with this email already exists.")
+        self._ensure_external_user_id_free(db_session, creator.external_user_id)
         creation_data = creator.model_dump()
-        internal_creator = UserCreateInternal(**creation_data)
+        internal_creator = UserCreateInternal(**creation_data, is_seed=is_seed)
         return super().create(db_session, internal_creator)
+
+    def _ensure_external_user_id_free(
+        self, db_session: DbSession, external_user_id: str | None, current: User | None = None
+    ) -> None:
+        """A specific 409 up front; the unique constraint still backs it up when two requests race."""
+        if (other := self.crud.get_by_external_user_id(db_session, external_user_id)) and other is not current:
+            raise ConflictError("User with this external_user_id already exists.")
 
     def update(
         self,
@@ -57,6 +77,7 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
         if not user:
             return None
 
+        self._ensure_external_user_id_free(db_session, updater.external_user_id, current=user)
         update_data = updater.model_dump(exclude_unset=True)
         internal_updater = UserUpdateInternal(**update_data)
         return self.crud.update(db_session, user, internal_updater)
@@ -80,11 +101,9 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
             try:
                 strategy = provider_factory.get_provider(connection.provider)
                 if oauth := strategy.oauth:
-                    user_connection_service.deregister_connection(db_session, connection, oauth)
+                    user_connection_service.deregister_from_provider(db_session, user.id, connection.provider, oauth)
             except Exception as e:
-                log_structured(
-                    self.logger,
-                    "warning",
+                logger.warning(
                     "Failed to deregister user",
                     user_id=user.id,
                     provider=connection.provider,
@@ -100,17 +119,58 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
                         release_stale_primary(connection.provider, connection.provider_user_id, scope=scope)
             force_release_backfill_lock(user.id)
         except Exception as e:
-            log_structured(
-                self.logger,
-                "warning",
+            logger.warning(
                 "Failed to release Redis locks on user deletion",
                 user_id=user.id,
                 error=str(e),
             )
 
-        return self.crud.delete(db_session, user)
+        user_id = user.id
+        deleted = self.crud.delete(db_session, user)
+        self._schedule_webhook_payload_deletion(user_id)
+        return deleted
 
-    @handle_exceptions
+    def _schedule_webhook_payload_deletion(self, user_id: UUID) -> None:
+        """Delete the user's outgoing webhook payloads from Svix in the background.
+
+        The countdown lets emit tasks already queued for this user land in Svix first,
+        so their payloads get deleted too.
+        """
+        if not svix_service.is_enabled():
+            return
+        try:
+            delete_user_webhook_payloads.apply_async(
+                args=[str(user_id)],
+                countdown=_WEBHOOK_PAYLOAD_DELETION_COUNTDOWN_SECONDS,
+            )
+        except Exception as e:
+            logger.warning(
+                "Failed to schedule webhook payload deletion on user deletion",
+                user_id=user_id,
+                error=str(e),
+            )
+
+    def get_detail(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        include: Sequence[UserInclude] = (),
+    ) -> UserDetailRead:
+        """One user, with the sync projection the list rows carry and the women's health flag."""
+        row = self.crud.get_with_connection_summary(db_session, user_id, include)
+        if row is None:
+            raise ResourceNotFoundError(self.name, user_id)
+
+        user, last_synced_at, last_synced_provider, has_active_connection, connections, has_womens_health_data = row
+        detail = UserDetailRead.model_validate(user)
+        detail.last_synced_at = last_synced_at
+        detail.last_synced_provider = last_synced_provider
+        detail.has_active_connection = bool(has_active_connection)
+        detail.has_womens_health_data = bool(has_womens_health_data)
+        if UserInclude.CONNECTIONS in include:
+            detail.connections = [UserConnectionSummary.model_validate(c) for c in connections or []]
+        return detail
+
     def get_users_paginated(
         self,
         db_session: DbSession,
@@ -119,19 +179,25 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
         rows, total_count = self.crud.get_users_with_filters(db_session, query_params)
 
         items = []
-        for user, last_synced_at, last_synced_provider, has_active_connection in rows:
+        for user, last_synced_at, last_synced_provider, has_active_connection, connections in rows:
             try:
                 user_read = UserRead.model_validate(user)
             except ValidationError as exc:
                 if not all("email" in e["loc"] for e in exc.errors()):
                     raise
-                self.logger.warning("Skipping user %s — invalid email: %s", user.id, user.email)
+                logger.warning(
+                    "Skipping user with invalid email",
+                    action="list_users_skip_invalid_email",
+                    user_id=str(user.id),
+                )
                 total_count -= 1
                 continue
 
             user_read.last_synced_at = last_synced_at
             user_read.last_synced_provider = last_synced_provider
             user_read.has_active_connection = bool(has_active_connection)
+            if UserInclude.CONNECTIONS in query_params.include:
+                user_read.connections = [UserConnectionSummary.model_validate(c) for c in connections or []]
             items.append(user_read)
 
         return OldPaginatedResponse[UserRead](
@@ -142,4 +208,4 @@ class UserService(AppService[UserRepository, User, UserCreateInternal, UserUpdat
         )
 
 
-user_service = UserService(log=getLogger(__name__))
+user_service = UserService()

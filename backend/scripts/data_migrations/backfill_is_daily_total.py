@@ -1,40 +1,40 @@
 #!/usr/bin/env python3
-# Backfill data_point_series.is_daily_total for archival (legacy) rows.
-#
-# Only daily-total rows are set to TRUE. Every other row is left NULL, which the
-# aggregation treats as FALSE (intraday / not a daily total). This keeps the
-# rewrite to the small minority of daily rows — the bulk of the table (intraday
-# samples, e.g. Apple ~86%) is never touched.
-#
-# SAFETY + IDEMPOTENCY: the script only ever flips NULL -> TRUE. It never touches
-# a row whose is_daily_total is already set (TRUE or FALSE). That makes re-runs
-# no-ops AND protects rows written by the post-deploy ingestion stamp — notably
-# Garmin epochs, which now carry external_id (a slot id) yet are FALSE, so a naive
-# "external_id IS NOT NULL -> TRUE" rule would wrongly flip them. Filtering on
-# `is_daily_total IS NULL` excludes them.
-#
-# PERFORMANCE: data_source_id and series ids are resolved up front, so every
-# UPDATE filters on (data_source_id, series_type_definition_id) — the leading
-# columns of uq_data_point_series_source_type_time — for an index range scan, no
-# per-batch JOINs. Work is committed in --batch chunks (no long locks / no single
-# giant transaction).
-#
-# Per-provider rules (only Garmin & Suunto have a daily+intraday overlap):
-#   garmin  steps/energy where external_id IS NOT NULL  -> daily total
-#           (legacy epochs had NULL external_id, so this cleanly selects dailies)
-#   garmin  distance/flights/resting_heart_rate (all)   -> daily (single channel)
-#   suunto  steps/energy: per day the max-value row is the daily total; on the
-#           first/last day only when max == sum(rest), i.e. value*2 == day_total
-#           (avoids labelling a partial boundary day's largest sample as a total)
-#   suunto  resting_heart_rate (all)                    -> daily
-#   oura    daily_activity/readiness/spo2/personal_info series -> daily
-#   polar   activities series (steps/energy/distance)   -> daily
-#   whoop   all series (recovery/body, daily cadence)   -> daily
-#   apple/google/samsung/ultrahuman: nothing (all intraday -> stay NULL = false)
-#
-# Usage (inside Docker):
-#   docker compose exec app uv run python scripts/data_migrations/backfill_is_daily_total.py --dry-run
-#   docker compose exec app uv run python scripts/data_migrations/backfill_is_daily_total.py
+"""Backfill series_sample.is_daily_total for archival (legacy) rows.
+
+Only daily-total rows are set to TRUE. Every other row is left NULL, which the
+aggregation treats as FALSE (intraday / not a daily total). This keeps the
+rewrite to the small minority of daily rows — the bulk of the table (intraday
+samples, e.g. Apple ~86%) is never touched.
+
+SAFETY + IDEMPOTENCY: the script only ever flips NULL -> TRUE. It never touches
+a row whose is_daily_total is already set (TRUE or FALSE). That makes re-runs
+no-ops AND protects rows written by the post-deploy ingestion stamp — notably
+Garmin epochs, which now carry external_id (a slot id) yet are FALSE, so a naive
+"external_id IS NOT NULL -> TRUE" rule would wrongly flip them. Filtering on
+`is_daily_total IS NULL` excludes them.
+
+PERFORMANCE: data_source_id and series ids are resolved up front, so every
+UPDATE filters on (data_source_id, series_type_definition_id) — the leading
+columns of uq_series_sample_source_type_time — for an index range scan, no
+per-batch JOINs. Work is committed in --batch chunks (no long locks / no single
+giant transaction).
+
+Per-provider rules — only summable series (steps/energy/distance/flights) ever
+get is_daily_total; non-summable series (HR, resting_hr, spo2, weight, vo2, ...)
+stay NULL. Providers not listed (apple/google/samsung/ultrahuman/whoop) need no
+backfill — their rows are all intraday or already daily-only.
+    garmin  steps/energy/distance/flights, but only rows with a non-null
+            external_id (the summaryId on daily rows; legacy intraday FIT/activity
+            uploads have NULL external_id, so they correctly stay NULL)
+    oura    steps/energy/distance (daily rows, no external_id)
+    polar   steps/energy/distance (daily rows, no external_id)
+    suunto  steps/energy: the per-day max-value row is the daily total; on the
+            first/last (possibly partial) day only when value*2 == day_total
+
+Usage (inside Docker):
+    docker compose exec app uv run python scripts/data_migrations/backfill_is_daily_total.py --dry-run
+    docker compose exec app uv run python scripts/data_migrations/backfill_is_daily_total.py
+"""
 
 import argparse
 import os
@@ -68,12 +68,12 @@ _RULE_PREDICATE = """
     AND is_daily_total IS NULL
     AND (NOT %(require_ext)s OR external_id IS NOT NULL)
 """
-RULE_COUNT_SQL = f"SELECT COUNT(*) FROM data_point_series WHERE {_RULE_PREDICATE}"
+RULE_COUNT_SQL = f"SELECT COUNT(*) FROM series_sample WHERE {_RULE_PREDICATE}"
 RULE_UPDATE_SQL = f"""
     WITH batch AS (
-        SELECT id FROM data_point_series WHERE {_RULE_PREDICATE} LIMIT %(batch)s
+        SELECT id FROM series_sample WHERE {_RULE_PREDICATE} LIMIT %(batch)s
     )
-    UPDATE data_point_series d SET is_daily_total = TRUE FROM batch WHERE d.id = batch.id
+    UPDATE series_sample d SET is_daily_total = TRUE FROM batch WHERE d.id = batch.id
 """
 
 # Suunto steps/energy daily total = the per-day max-value row. On the first/last
@@ -92,7 +92,7 @@ _SUUNTO_DAILY_IDS = """
             ) AS rn,
             MIN(recorded_at::date) OVER src AS first_d,
             MAX(recorded_at::date) OVER src AS last_d
-        FROM data_point_series
+        FROM series_sample
         WHERE data_source_id = ANY(%(sources)s) AND series_type_definition_id = ANY(%(series)s)
         WINDOW
             w AS (PARTITION BY data_source_id, series_type_definition_id, recorded_at::date),
@@ -102,17 +102,17 @@ _SUUNTO_DAILY_IDS = """
     WHERE rn = 1 AND ((d <> first_d AND d <> last_d) OR (value * 2 = day_total))
 """
 SUUNTO_COUNT_SQL = f"""
-    SELECT COUNT(*) FROM data_point_series
+    SELECT COUNT(*) FROM series_sample
     WHERE id IN ({_SUUNTO_DAILY_IDS}) AND is_daily_total IS NULL
 """
 SUUNTO_UPDATE_SQL = f"""
     WITH daily AS ({_SUUNTO_DAILY_IDS}),
          batch AS (
-            SELECT id FROM data_point_series
+            SELECT id FROM series_sample
             WHERE id IN (SELECT id FROM daily) AND is_daily_total IS NULL
             LIMIT %(batch)s
          )
-    UPDATE data_point_series d SET is_daily_total = TRUE FROM batch WHERE d.id = batch.id
+    UPDATE series_sample d SET is_daily_total = TRUE FROM batch WHERE d.id = batch.id
 """
 
 
@@ -162,9 +162,7 @@ def run_batched(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Backfill data_point_series.is_daily_total (legacy NULL rows -> TRUE)."
-    )
+    parser = argparse.ArgumentParser(description="Backfill series_sample.is_daily_total (legacy NULL rows -> TRUE).")
     parser.add_argument("--dry-run", action="store_true", help="Count rows that would change; make no changes.")
     parser.add_argument("--batch", type=int, default=50000, help="Rows per UPDATE batch (default 50000).")
     args = parser.parse_args()

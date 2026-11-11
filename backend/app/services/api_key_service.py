@@ -1,24 +1,31 @@
 import secrets
-from logging import Logger, getLogger
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header
+from sqlalchemy.orm import Session
 
-from app.database import DbSession
+from app.database import DbSession, SessionLocal
 from app.models import ApiKey, Developer
 from app.repositories.api_key_repository import ApiKeyRepository
 from app.schemas.model_crud.credentials import ApiKeyCreate, ApiKeyUpdate
 from app.services.services import AppService
-from app.utils.auth import get_current_developer_optional
+from app.utils.auth import get_current_developer_optional, oauth2_scheme, validate_api_key
+from app.utils.exceptions import AuthenticationError, ResourceNotFoundError
+from app.utils.security import hash_api_key
+from app.utils.structured_logging import get_logger
+
+logger = get_logger(__name__)
+
+# Number of leading characters of the raw key kept in clear for display ("sk-" + 7 hex chars).
+KEY_PREFIX_LENGTH = 10
 
 
 class ApiKeyService(AppService[ApiKeyRepository, ApiKey, ApiKeyCreate, ApiKeyUpdate]):
-    def __init__(self, log: Logger, **kwargs):
+    def __init__(self, **kwargs):
         super().__init__(
             crud_model=ApiKeyRepository,
             model=ApiKey,
-            log=log,
             **kwargs,
         )
 
@@ -26,34 +33,69 @@ class ApiKeyService(AppService[ApiKeyRepository, ApiKey, ApiKeyCreate, ApiKeyUpd
         """Generate random API key with sk- prefix and 32 hex characters."""
         return f"sk-{secrets.token_hex(16)}"
 
-    def create_api_key(self, db: DbSession, created_by: UUID | None, name: str = "Default") -> ApiKey:
-        key_value = self._generate_key_value()
-        creator = ApiKeyCreate(id=key_value, name=name, created_by=created_by)
+    def create_api_key(self, db: DbSession, created_by: UUID | None, name: str = "Default") -> tuple[ApiKey, str]:
+        """Create an API key.
+
+        Returns:
+            Tuple of (ApiKey, raw_key). Only the hash and a short prefix are persisted,
+            so the raw key can be shown to the caller exactly once.
+        """
+        raw_key = self._generate_key_value()
+        creator = ApiKeyCreate(
+            key_hash=hash_api_key(raw_key),
+            key_prefix=raw_key[:KEY_PREFIX_LENGTH],
+            name=name,
+            created_by=created_by,
+        )
         api_key = self.create(db, creator)
-        self.logger.debug(f"Created API key {api_key.id} by developer {created_by} with name {name}")
-        return api_key
+        logger.debug(
+            "Created API key",
+            api_key_id=str(api_key.id),
+            developer_id=str(created_by) if created_by else None,
+        )
+        return api_key, raw_key
 
     def list_api_keys(self, db: DbSession) -> list[ApiKey]:
         """List all API keys ordered by creation date."""
         keys = self.crud.get_all_ordered(db)
-        self.logger.debug(f"Listed {len(keys)} API keys")
+        logger.debug("Listed API keys", count=len(keys))
         return keys
 
-    def rotate_api_key(self, db: DbSession, old_key: str, created_by: UUID | None) -> ApiKey:
-        """Rotate API key - delete old and create new."""
-        self.delete(db, old_key, raise_404=True)
-        new_key = self.create_api_key(db, created_by)
-        self.logger.debug(f"Rotated API key from {old_key} to {new_key.id}")
-        return new_key
+    def rotate_api_key(self, db: DbSession, key_id: UUID, created_by: UUID | None) -> tuple[ApiKey, str]:
+        """Rotate API key - delete the old one and create a new one with the same name.
+
+        The delete is only flushed, so the commit issued when the replacement is created
+        covers both steps. If creating the replacement fails, the old key stays valid.
+
+        Returns:
+            Tuple of (new ApiKey, raw_key). The raw key is shown to the caller exactly once.
+        """
+        if not (old_key := self.get(db, key_id, raise_404=True)):
+            raise ResourceNotFoundError(self.name, key_id)
+        name = old_key.name
+        self.crud.delete_flush(db, old_key)
+        try:
+            new_key, raw_key = self.create_api_key(db, created_by, name)
+        except Exception:
+            db.rollback()
+            raise
+        logger.debug("Rotated API key", api_key_id=str(key_id), new_api_key_id=str(new_key.id))
+        return new_key, raw_key
 
     def validate_api_key(self, db: DbSession, key: str) -> ApiKey:
-        """Validate API key exists in database. Raises 401 if invalid."""
-        if not (api_key := self.get(db, key)):
-            raise HTTPException(status_code=401, detail="Invalid or missing API key")
-        return api_key
+        """Validate the raw API key against stored hashes. Raises 401 if invalid."""
+        return validate_api_key(db, key)
 
 
-api_key_service = ApiKeyService(log=getLogger(__name__))
+api_key_service = ApiKeyService()
+
+
+async def _authenticate(db: Session, developer: Developer | None, api_key: str | None) -> str:
+    if developer:
+        return str(developer.id)
+    if api_key:
+        return str(api_key_service.validate_api_key(db, api_key).id)
+    raise AuthenticationError("Authentication required: provide JWT token or API key")
 
 
 async def _require_api_key(
@@ -61,11 +103,23 @@ async def _require_api_key(
     developer: Developer | None = Depends(get_current_developer_optional),
     x_open_wearables_api_key: str | None = Header(None, alias="X-Open-Wearables-API-Key"),
 ) -> str:
-    if developer:
-        return str(developer.id)
-    if x_open_wearables_api_key:
-        return api_key_service.validate_api_key(db, x_open_wearables_api_key).id
-    raise HTTPException(status_code=401, detail="Authentication required: provide JWT token or API key")
+    return await _authenticate(db, developer, x_open_wearables_api_key)
 
 
-ApiKeyDep = Annotated[str, Depends(_require_api_key)]
+async def _require_api_key_detached(
+    token: Annotated[str | None, Depends(oauth2_scheme)] = None,
+    x_open_wearables_api_key: str | None = Header(None, alias="X-Open-Wearables-API-Key"),
+) -> str:
+    """Same rule as ApiKeyDep, but on a session released before the endpoint returns.
+
+    DbSession is a yield dependency, so anything that declares it — including the usual auth
+    dependency — holds a pooled connection until the response completes. For a stream that is
+    until the client disconnects, so a streaming endpoint has to authenticate detached.
+    """
+    with SessionLocal() as db:
+        return await _authenticate(db, await get_current_developer_optional(db, token), x_open_wearables_api_key)
+
+
+API_KEY_REQUIRED = Depends(_require_api_key)
+ApiKeyDep = Annotated[str, API_KEY_REQUIRED]
+StreamingApiKeyDep = Annotated[str, Depends(_require_api_key_detached)]

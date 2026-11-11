@@ -5,8 +5,11 @@ from decimal import Decimal
 from typing import Any, Iterable
 from uuid import UUID, uuid4
 
+from app.constants.entry_source import get_unified_oura_entry_source
+from app.constants.intensity import get_unified_oura_intensity
 from app.constants.workout_types.oura import get_unified_workout_type
 from app.database import DbSession
+from app.schemas.enums import EventCategory
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
     EventRecordDetailCreate,
@@ -17,7 +20,9 @@ from app.services.event_record_service import event_record_service
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
 from app.services.raw_payload_storage import store_raw_payload
 from app.utils.dates import offset_to_iso
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class OuraWorkouts(BaseWorkoutsTemplate):
@@ -67,18 +72,14 @@ class OuraWorkouts(BaseWorkoutsTemplate):
                     break
 
             except Exception as e:
-                log_structured(
-                    self.logger,
-                    "error",
+                logger.error(
                     "Error fetching Oura workout data",
                     action="oura_workout_fetch_error",
                     error=str(e),
                     user_id=str(user_id),
                 )
                 if all_workouts:
-                    log_structured(
-                        self.logger,
-                        "warning",
+                    logger.warning(
                         "Returning partial workout data due to error",
                         action="oura_workout_partial_data",
                         error=str(e),
@@ -105,11 +106,18 @@ class OuraWorkouts(BaseWorkoutsTemplate):
         """Get detailed workout data from Oura API."""
         return self._make_api_request(db, user_id, f"/v2/usercollection/workout/{workout_id}")
 
-    def save_by_id(self, db: DbSession, user_id: UUID, workout_id: str) -> int:
+    def save_by_id(self, db: DbSession, user_id: UUID, workout_id: str, trace_id: str | None = None) -> int:
         """Fetch a single workout by ID and save it."""
         raw = self.get_workout_detail_from_api(db, user_id, workout_id)
         if not raw or not isinstance(raw, dict):
             return 0
+        store_raw_payload(
+            source="api_response",
+            provider="oura",
+            payload=raw,
+            user_id=str(user_id),
+            trace_id=trace_id,
+        )
         count = 0
         for record, details in self._build_bundles([OuraWorkoutJSON(**raw)], user_id):
             created = event_record_service.create(db, record)
@@ -145,6 +153,17 @@ class OuraWorkouts(BaseWorkoutsTemplate):
             duration_seconds = int((end_dt - start_dt).total_seconds())
             metrics["moving_time_seconds"] = duration_seconds
 
+        entry_source = get_unified_oura_entry_source(raw_workout.source)
+        if entry_source is not None:
+            metrics["entry_source"] = entry_source
+
+        intensity = get_unified_oura_intensity(raw_workout.intensity)
+        if intensity is not None:
+            metrics["intensity"] = intensity
+
+        if raw_workout.label:
+            metrics["label"] = raw_workout.label
+
         return metrics
 
     def _normalize_workout(
@@ -171,7 +190,7 @@ class OuraWorkouts(BaseWorkoutsTemplate):
         metrics = self._build_metrics(raw_workout)
 
         workout_create = EventRecordCreate(
-            category="workout",
+            category=EventCategory.WORKOUT,
             type=workout_type.value,
             source_name="Oura",
             device_model=None,

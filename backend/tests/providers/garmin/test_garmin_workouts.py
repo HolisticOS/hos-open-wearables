@@ -7,14 +7,17 @@ from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
 import pytest
+from psycopg.errors import ForeignKeyViolation, NotNullViolation
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import EventRecord
 from app.repositories.event_record_repository import EventRecordRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.enums import WorkoutType
+from app.schemas.enums import EntrySource, SeriesType, WorkoutType
 from app.schemas.model_crud.activities import EventRecordCreate, EventRecordDetailCreate
 from app.schemas.providers.garmin import ActivityJSON as GarminActivityJSON
+from app.services.providers.garmin.handlers.activities import process_activity_notification
 from app.services.providers.garmin.oauth import GarminOAuth
 from app.services.providers.garmin.workouts import GarminWorkouts
 from tests.factories import UserConnectionFactory, UserFactory
@@ -127,6 +130,7 @@ class TestGarminWorkouts:
         assert metrics["heart_rate_min"] is None
         assert metrics["steps_count"] == 8500
         assert metrics["energy_burned"] == Decimal("650")
+        assert metrics["energy_series"] == SeriesType.total_energy
         assert metrics["distance"] == Decimal("10000")
 
     def test_build_metrics_with_missing_values(self, garmin_workouts: GarminWorkouts) -> None:
@@ -149,6 +153,39 @@ class TestGarminWorkouts:
 
         # Should handle zero values
         assert metrics["steps_count"] == 0
+
+    def test_build_metrics_entry_source_and_label(self, garmin_workouts: GarminWorkouts) -> None:
+        """manual=True is a hand-typed Connect entry -> MANUAL; isWebUpload=True is a real
+        file from another device, still measured data -> AUTOMATIC."""
+        base = {
+            "userId": "user_123",
+            "activityId": "act_manual",
+            "activityType": "RUNNING",
+            "startTimeInSeconds": 1705309200,
+            "durationInSeconds": 3600,
+            "activityName": "Trail Run",
+        }
+
+        manual = GarminActivityJSON(**base, manual=True)
+        assert garmin_workouts._build_metrics(manual)["entry_source"] == EntrySource.MANUAL
+
+        web_upload = GarminActivityJSON(**base, isWebUpload=True)
+        assert garmin_workouts._build_metrics(web_upload)["entry_source"] == EntrySource.AUTOMATIC
+
+        manual_takes_priority = GarminActivityJSON(**base, manual=True, isWebUpload=True)
+        assert garmin_workouts._build_metrics(manual_takes_priority)["entry_source"] == EntrySource.MANUAL
+
+        auto = GarminActivityJSON(**base, manual=False, isWebUpload=False)
+        assert garmin_workouts._build_metrics(auto)["entry_source"] == EntrySource.AUTOMATIC
+
+        # The shape every real `activities` push has.
+        real_push = GarminActivityJSON(**base, isWebUpload=False)
+        assert garmin_workouts._build_metrics(real_push)["entry_source"] == EntrySource.AUTOMATIC
+
+        no_flags = GarminActivityJSON(**base)
+        assert "entry_source" not in garmin_workouts._build_metrics(no_flags)
+
+        assert garmin_workouts._build_metrics(manual)["label"] == "Trail Run"
 
     def test_normalize_workout(self, garmin_workouts: GarminWorkouts, sample_activity: dict[str, Any]) -> None:
         """Test normalizing Garmin activity to event record."""
@@ -258,3 +295,40 @@ class TestGarminWorkouts:
 
             assert result == {"detail": "data"}
             mock_detail.assert_called_once_with(db, user.id, "workout_123")
+
+
+class TestActivityNotificationLinkedProfiles:
+    NOTIFICATION = {
+        "userId": "garmin_user_123",
+        "activityId": "12345678901",
+        "summaryId": "summary_123",
+        "activityType": "RUNNING",
+        "startTimeInSeconds": 1705309200,
+        "durationInSeconds": 3600,
+    }
+
+    def test_a_profile_deleted_meanwhile_does_not_stop_the_others(self) -> None:
+        """The deleted user's insert violates its foreign key; the linked profile still gets the activity."""
+        deleted, linked = MagicMock(user_id=uuid4()), MagicMock(user_id=uuid4())
+        connection_repo = MagicMock()
+        connection_repo.get_all_by_provider_user_id.return_value = [deleted, linked]
+        garmin_workouts = MagicMock()
+        garmin_workouts.process_push_activities.side_effect = [
+            IntegrityError("INSERT ...", {}, ForeignKeyViolation("user is gone")),
+            [uuid4()],
+        ]
+
+        results = process_activity_notification(
+            MagicMock(), connection_repo, garmin_workouts, self.NOTIFICATION, "trace-1"
+        )
+
+        assert [r["status"] for r in results] == ["skipped", "saved"]
+
+    def test_another_constraint_violation_is_raised(self) -> None:
+        connection_repo = MagicMock()
+        connection_repo.get_all_by_provider_user_id.return_value = [MagicMock(user_id=uuid4())]
+        garmin_workouts = MagicMock()
+        garmin_workouts.process_push_activities.side_effect = IntegrityError("INSERT ...", {}, NotNullViolation("x"))
+
+        with pytest.raises(IntegrityError):
+            process_activity_notification(MagicMock(), connection_repo, garmin_workouts, self.NOTIFICATION, "trace-1")

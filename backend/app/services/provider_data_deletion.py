@@ -14,7 +14,6 @@ one are deleted.
 Scheduling is best-effort: a broken broker never fails the disconnect itself.
 """
 
-from logging import getLogger
 from typing import Any
 from uuid import UUID
 
@@ -26,9 +25,9 @@ from app.models import HealthScore
 from app.repositories import DataSourceRepository, HealthScoreRepository, UserConnectionRepository
 from app.schemas.auth import ConnectionStatus
 from app.schemas.enums import ProviderName
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 DELETE_TASK = "app.integrations.celery.tasks.delete_provider_data_task.delete_provider_data"
 
@@ -44,11 +43,9 @@ def schedule_provider_data_deletion(user_id: UUID | str, provider: str, *, reaso
     try:
         celery.current_app.send_task(DELETE_TASK, args=[str(user_id), provider])
     except Exception:
-        logger.warning("Could not queue provider data deletion for %s/%s", user_id, provider, exc_info=True)
+        logger.warning("Could not queue provider data deletion", user_id=str(user_id), provider=provider, exc_info=True)
         return False
-    log_structured(
-        logger,
-        "info",
+    logger.info(
         "Queued provider data deletion",
         provider=provider,
         user_id=str(user_id),
@@ -66,9 +63,7 @@ def delete_provider_data(db: DbSession, user_id: UUID, provider: str) -> dict[st
     provider_enum = ProviderName(provider)
     connection = connection_repo.get_by_user_and_provider(db, user_id, provider)
     if connection and connection.status == ConnectionStatus.ACTIVE:
-        log_structured(
-            logger,
-            "info",
+        logger.info(
             "Skipped provider data deletion: connection is active again",
             provider=provider,
             user_id=str(user_id),
@@ -76,12 +71,10 @@ def delete_provider_data(db: DbSession, user_id: UUID, provider: str) -> dict[st
         return {"status": "skipped_reconnected", "data_sources": 0, "health_scores": 0}
 
     health_scores = health_score_repo.delete_by_user_and_provider(db, user_id, provider_enum)
-    data_sources = data_source_repo.delete_by_user_and_provider(db, user_id, provider_enum)
+    data_sources = data_source_repo.delete_user_provider_data(db, user_id, provider_enum)
     db.commit()
 
-    log_structured(
-        logger,
-        "info",
+    logger.info(
         "Deleted provider data after disconnect",
         provider=provider,
         user_id=str(user_id),

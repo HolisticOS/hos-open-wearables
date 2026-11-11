@@ -1,11 +1,16 @@
 from pydantic import BaseModel, Field
 
+from app.config import settings
+
 MIN_EXPIRATION_SECONDS = 60  # 1 minute
 MAX_EXPIRATION_SECONDS = 3600  # 1 hour
 DEFAULT_EXPIRATION_SECONDS = 300  # 5 minutes
 MIN_FILE_SIZE = 1024  # 1KB
-MAX_FILE_SIZE = 1024 * 1024 * 1024  # 500MB
+MAX_FILE_SIZE = settings.apple_xml_max_file_size_bytes
 DEFAULT_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+# A direct upload travels inside the Celery message: Redis caps it at 512 MiB (~288 MiB of file after
+# encoding) and the API holds several copies while publishing. Larger files go through multipart.
+MAX_DIRECT_UPLOAD_SIZE = 200 * 1024 * 1024  # 200MB
 
 
 class PresignedURLRequest(BaseModel):
@@ -20,7 +25,7 @@ class PresignedURLRequest(BaseModel):
         default=DEFAULT_FILE_SIZE,
         ge=MIN_FILE_SIZE,
         le=MAX_FILE_SIZE,
-        description="Maximum file size in bytes (1KB - 500MB)",
+        description="Maximum file size in bytes (1KB - 5GiB)",
     )
 
 

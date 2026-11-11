@@ -1,29 +1,33 @@
+from typing import ClassVar
+
 from sqlalchemy import Index
 from sqlalchemy.orm import Mapped
 
-from app.mappings import FKEventRecordDetail, json_binary, numeric_5_2
+from app.mappings import FKEventRecord, json_binary, numeric_5_2, str_64
+from app.schemas.enums import EventCategory
 
-from .event_record_detail import EventRecordDetail
+from .event_record_detail import DetailType, EventRecordDetail
 
 
 class SleepDetails(EventRecordDetail):
     """Per-sleep aggregates and metrics."""
 
     __tablename__ = "sleep_details"
-    __mapper_args__ = {"polymorphic_identity": "sleep"}
     __table_args__ = (
         Index(
             "ix_sleep_details_stages_gin",
             "sleep_stages",
             postgresql_using="gin",
-            postgresql_ops={
-                "sleep_stages": "jsonb_path_ops"
-            }
+            postgresql_ops={"sleep_stages": "jsonb_path_ops"},
         ),
     )
 
-    record_id: Mapped[FKEventRecordDetail]
+    detail_type: ClassVar[DetailType] = EventCategory.SLEEP
 
+    record_id: Mapped[FKEventRecord]
+
+    # Whole minutes. Time asleep excludes awake time; time in bed includes it. The session's
+    # start-to-end time is EventRecord.duration_seconds.
     sleep_total_duration_minutes: Mapped[int | None]
     sleep_time_in_bed_minutes: Mapped[int | None]
     sleep_efficiency_score: Mapped[numeric_5_2 | None]
@@ -34,3 +38,7 @@ class SleepDetails(EventRecordDetail):
 
     is_nap: Mapped[bool | None]
     sleep_stages: Mapped[json_binary | None]
+
+    # Sleep state as the provider sent it (Garmin validation, Whoop score_state, Google Health processed), read by
+    # app.services.sleep_finality
+    provider_state: Mapped[str_64 | None]

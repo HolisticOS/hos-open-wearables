@@ -95,7 +95,7 @@ class TestListSettings:
         monkeypatch.setenv("HISTORICAL_SYNC_DISABLED_PROVIDERS", "Garmin, polar")
         monkeypatch.setenv("DELETE_PROVIDER_DATA_ON_DISCONNECT", "false")
 
-        loaded = Settings(secret_key="x")  # ty: ignore[missing-argument]
+        loaded = Settings(secret_key="x" * 32)  # ty: ignore[missing-argument]
 
         assert loaded.oauth_allowed_redirect_prefixes == ["myapp://providers/connected", "https://a.io/cb"]
         assert loaded.historical_sync_disabled_providers == ["garmin", "polar"]
@@ -104,7 +104,9 @@ class TestListSettings:
     def test_json_list_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HISTORICAL_SYNC_DISABLED_PROVIDERS", '["garmin"]')
 
-        assert Settings(secret_key="x").historical_sync_disabled_providers == ["garmin"]  # ty: ignore[missing-argument]
+        assert Settings(secret_key="x" * 32).historical_sync_disabled_providers == [
+            "garmin"
+        ]  # ty: ignore[missing-argument]
 
     def test_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for name in (
@@ -114,7 +116,7 @@ class TestListSettings:
         ):
             monkeypatch.delenv(name, raising=False)
 
-        loaded = Settings(secret_key="x", _env_file=None)  # ty: ignore[missing-argument, unknown-argument]
+        loaded = Settings(secret_key="x" * 32, _env_file=None)  # ty: ignore[missing-argument, unknown-argument]
 
         assert loaded.oauth_allowed_redirect_prefixes == []
         assert loaded.historical_sync_disabled_providers == []

@@ -1,5 +1,8 @@
 from .data_point_series import (
+    CalendarPeriod,
     HeartRateSampleCreate,
+    SessionValue,
+    StatColumn,
     StepSampleCreate,
     TimeSeriesQueryParams,
     TimeSeriesSampleBase,
@@ -14,6 +17,8 @@ from .event_record import (
     EventRecordQueryParams,
     EventRecordResponse,
     EventRecordUpdate,
+    SleepInclude,
+    WorkoutInclude,
 )
 from .event_record_detail import (
     EventRecordDetailBase,
@@ -29,17 +34,22 @@ from .health_score import (
     HealthScoreUpdate,
     ScoreComponent,
 )
+from .meal import MealDetailCreate
 from .menstrual_cycle import MenstrualCycleDetailCreate
 from .personal_record import (
     PersonalRecordBase,
     PersonalRecordCreate,
     PersonalRecordResponse,
     PersonalRecordUpdate,
+    sex_to_db,
 )
 from .sleep import SleepStage
 
 __all__ = [
-    # DataPointSeries (rename from timeseries maybe)
+    "CalendarPeriod",
+    "SessionValue",
+    "StatColumn",
+    # SeriesSample (rename from timeseries maybe)
     "TimeSeriesSampleBase",
     "TimeSeriesSampleCreate",
     "TimeSeriesSampleUpdate",
@@ -54,6 +64,8 @@ __all__ = [
     "EventRecordCreate",
     "EventRecordUpdate",
     "EventRecordResponse",
+    "SleepInclude",
+    "WorkoutInclude",
     # EventRecordDetail
     "EventRecordDetailBase",
     "EventRecordDetailCreate",
@@ -64,8 +76,11 @@ __all__ = [
     "PersonalRecordCreate",
     "PersonalRecordUpdate",
     "PersonalRecordResponse",
+    "sex_to_db",
     # MenstrualCycle
     "MenstrualCycleDetailCreate",
+    # Meal
+    "MealDetailCreate",
     # Sleep
     "SleepStage",
     # HealthScore

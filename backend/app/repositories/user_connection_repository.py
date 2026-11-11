@@ -1,5 +1,4 @@
 from datetime import datetime, timedelta, timezone
-from logging import getLogger
 from typing import cast
 from uuid import UUID, uuid4
 
@@ -11,12 +10,14 @@ from app.database import DbSession
 from app.models import UserConnection
 from app.repositories.repositories import CrudRepository
 from app.schemas.auth import ConnectionStatus
+from app.schemas.enums import SdkConnectionOutcome
 from app.schemas.model_crud.user_management import (
     UserConnectionCreate,
     UserConnectionUpdate,
 )
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCreate, UserConnectionUpdate]):
@@ -166,7 +167,8 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         except MultipleResultsFound:
             logger.warning(
                 "Multiple active connections found for provider_user_id — returning first",
-                extra={"provider": provider, "provider_user_id": provider_user_id},
+                provider=provider,
+                provider_user_id=provider_user_id,
             )
             return self._active_by_provider_external_id(db_session, provider, provider_user_id).first()
 
@@ -196,7 +198,7 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         except MultipleResultsFound:
             logger.warning(
                 "Multiple active connections found for provider_username — returning first",
-                extra={"provider": provider, "provider_username": provider_username},
+                provider=provider,
             )
             return (
                 db_session.query(self.model)
@@ -233,6 +235,8 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         )
         result: dict[tuple[str, str], list[UUID]] = {}
         for provider, provider_user_id, linked_user_id in rows:
+            if provider_user_id is None:
+                continue
             result.setdefault((provider, provider_user_id), []).append(linked_user_id)
         return result
 
@@ -276,10 +280,11 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         return db_session.query(self.model).filter(and_(*filters)).all()
 
     def disconnect(self, db_session: DbSession, user_id: UUID, provider: str) -> int:
-        """Disconnect a provider in a single UPDATE query. Returns number of rows updated.
+        """Revoke a provider connection and clear its tokens.
 
-        Also clears tokens left on a connection that was already marked revoked
-        (e.g. by a failed refresh), so a disconnect never leaves tokens behind.
+        Returns the number of connections that went from non-revoked to revoked. Tokens are
+        cleared even on an already revoked connection, e.g. one revoked by a failed token
+        refresh during provider deregistration.
         """
         result = cast(
             CursorResult[tuple[()]],
@@ -304,6 +309,17 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                     updated_at=datetime.now(timezone.utc),
                 ),
             ),
+        )
+        db_session.execute(
+            update(UserConnection)
+            .where(
+                and_(
+                    UserConnection.user_id == user_id,
+                    UserConnection.provider == provider,
+                    or_(UserConnection.access_token.is_not(None), UserConnection.refresh_token.is_not(None)),
+                ),
+            )
+            .values(access_token=None, refresh_token=None, token_expires_at=None),
         )
         db_session.commit()
         return result.rowcount
@@ -379,6 +395,10 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         db_session.refresh(connection)
         return connection
 
+    def reload_tokens(self, db_session: DbSession, connection: UserConnection) -> None:
+        """Re-read the token columns another worker may have written, keeping unflushed changes to the rest."""
+        db_session.refresh(connection, attribute_names=["access_token", "refresh_token", "token_expires_at"])
+
     def update_last_synced_at(self, db_session: DbSession, connection: UserConnection) -> UserConnection:
         """Update the last synced timestamp."""
         connection.last_synced_at = datetime.now(timezone.utc)
@@ -400,26 +420,39 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
             .all()
         )
 
-    def get_all_active_users(self, db_session: DbSession) -> list[UUID]:
-        """Get all unique user IDs that have active connections."""
-        return [
-            row.user_id
-            for row in db_session.query(self.model.user_id)
-            .filter(self.model.status == ConnectionStatus.ACTIVE)
-            .distinct()
+    def get_all_active_by_provider(self, db_session: DbSession, provider: str) -> list[UserConnection]:
+        return (
+            db_session.query(self.model)
+            .filter(
+                and_(
+                    self.model.provider == provider,
+                    self.model.status == ConnectionStatus.ACTIVE,
+                ),
+            )
             .all()
-        ]
+        )
+
+    def get_all_active_users(self, db_session: DbSession, providers: list[str] | None = None) -> list[UUID]:
+        """Unique user IDs with an active connection, optionally only to one of ``providers``."""
+        query = db_session.query(self.model.user_id).filter(self.model.status == ConnectionStatus.ACTIVE)
+        if providers is not None:
+            query = query.filter(self.model.provider.in_(providers))
+        return [row.user_id for row in query.distinct().all()]
 
     def ensure_sdk_connection(
         self,
         db_session: DbSession,
         user_id: UUID,
         provider: str,
-    ) -> UserConnection:
+    ) -> tuple[UserConnection, SdkConnectionOutcome]:
         """Ensure an SDK-based connection exists for a user and provider.
 
         SDK-based providers (like Apple Health) don't use OAuth tokens.
         This method creates or returns an existing connection without tokens.
+
+        Returns the connection and which branch was taken, so the caller can emit
+        ``connection.created`` only on a real state change. The upload path calls
+        this on every batch, so EXISTING must stay silent.
         """
         existing = self.get_by_user_and_provider(db_session, user_id, provider)
         if existing:
@@ -430,7 +463,8 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
                 db_session.add(existing)
                 db_session.commit()
                 db_session.refresh(existing)
-            return existing
+                return existing, SdkConnectionOutcome.REACTIVATED
+            return existing, SdkConnectionOutcome.EXISTING
 
         # Create new SDK connection (no tokens needed)
         connection = UserConnection(
@@ -447,4 +481,4 @@ class UserConnectionRepository(CrudRepository[UserConnection, UserConnectionCrea
         db_session.add(connection)
         db_session.commit()
         db_session.refresh(connection)
-        return connection
+        return connection, SdkConnectionOutcome.CREATED
