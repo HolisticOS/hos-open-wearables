@@ -4,6 +4,7 @@ Integration tests for Apple SDK (HealthKit) data import.
 Tests the full import flow for Apple HealthKit data via SDK.
 """
 
+import json
 import logging
 from decimal import Decimal
 from typing import Any
@@ -329,6 +330,28 @@ class TestAppleSDKImport:
 
         workouts = db.query(EventRecord).filter(EventRecord.category == "workout").all()
         assert len(workouts) == 1
+
+    def test_import_from_request_reports_saved_counts(
+        self,
+        db: Session,
+        import_service: ImportService,
+        sample_sdk_payload: dict[str, Any],
+    ) -> None:
+        """process_sdk_upload only notifies HOS when these counts are non-zero.
+
+        They were missing from the response, so an Apple Health workout never
+        reached HOS until the app next opened.
+        """
+        user = UserFactory()
+
+        result = import_service.import_data_from_request(
+            db, json.dumps(sample_sdk_payload), "application/json", str(user.id)
+        )
+
+        assert result.status_code == 200
+        assert result.workouts_saved == 1
+        assert result.records_saved is not None
+        assert result.sleep_saved is not None
 
     def test_import_records_as_time_series(
         self,
