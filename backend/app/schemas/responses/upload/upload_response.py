@@ -11,3 +11,8 @@ class UploadDataResponse(BaseModel):
     status_code: int = Field(..., description="HTTP status code (typically 202 for async operations)")
     response: str = Field(..., description="Human-readable response message")
     user_id: str | None = Field(None, description="User ID associated with the import operation")
+    # Set only by the background import, never on the 202 "queued" reply.
+    # process_sdk_upload reads them to decide whether HOS should hear about it.
+    records_saved: int | None = Field(None, description="Samples saved by the import")
+    workouts_saved: int | None = Field(None, description="New workouts saved by the import")
+    sleep_saved: int | None = Field(None, description="Sleep sessions saved by the import")
