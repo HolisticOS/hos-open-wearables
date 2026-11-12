@@ -5,7 +5,6 @@ and once as the window's follow-up (``trailing``), which only sends if more
 data arrived inside the window.
 """
 
-from logging import getLogger
 from typing import Any
 
 import httpx
@@ -13,9 +12,9 @@ from celery import Task, shared_task
 
 from app.config import settings
 from app.services import hos_notify
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @shared_task(
@@ -42,9 +41,7 @@ def notify_hos(self: Task, user_id: str, provider: str, trailing: bool = False) 
         )
         response.raise_for_status()
     except httpx.HTTPError as exc:
-        log_structured(
-            logger,
-            "warning",
+        logger.warning(
             "HOS notify failed, scheduling retry",
             provider=provider,
             user_id=user_id,
@@ -53,5 +50,5 @@ def notify_hos(self: Task, user_id: str, provider: str, trailing: bool = False) 
         )
         raise self.retry(exc=exc)
 
-    log_structured(logger, "info", "HOS notified", provider=provider, user_id=user_id, trailing=trailing)
+    logger.info("HOS notified", provider=provider, user_id=user_id, trailing=trailing)
     return {"status": "sent", "user_id": user_id}

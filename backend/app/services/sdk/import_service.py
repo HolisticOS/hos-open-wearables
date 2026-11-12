@@ -1,0 +1,929 @@
+import json
+import time
+from collections import Counter
+from collections.abc import Generator
+from datetime import datetime
+from decimal import Decimal
+from typing import Any, Iterable, TypedDict
+from uuid import UUID, uuid4
+
+import sentry_sdk
+from packaging.version import InvalidVersion, Version
+from pydantic import ValidationError
+
+from app.config import settings
+from app.constants.entry_source import get_unified_sdk_entry_source
+from app.constants.series_types.sdk import (
+    WorkoutStatisticType,
+    get_detail_field_from_workout_statistic_type,
+    get_detail_field_precedence,
+    get_series_type_from_metric_type,
+    get_series_type_from_workout_statistic_type,
+)
+from app.constants.series_types.sdk.workout_samples import WORKOUT_ROUTE_FIELD_TO_SERIES_TYPE, WORKOUT_SAMPLE_TYPES
+from app.constants.series_types.sdk.workout_statistics import WORKOUT_ENERGY_SERIES, WORKOUT_STATISTIC_STAT
+from app.constants.series_types.workout_detail_stats import UNDECIDED_WORKOUT_SERIES
+from app.constants.workout_types import get_unified_sdk_workout_type
+from app.database import DbSession
+from app.repositories.user_connection_repository import UserConnectionRepository
+from app.schemas.enums import DeviceType, EventCategory, SeriesType, daily_total_flag
+from app.schemas.model_crud.activities import (
+    EventRecordCreate,
+    EventRecordDetailCreate,
+    EventRecordMetrics,
+    HeartRateSampleCreate,
+    MealDetailCreate,
+    SessionValue,
+    StepSampleCreate,
+    TimeSeriesSampleCreate,
+)
+from app.schemas.providers.mobile_sdk import (
+    SyncRequest as SDKSyncRequest,
+)
+from app.schemas.providers.mobile_sdk import (
+    WorkoutStatistic,
+)
+from app.schemas.providers.mobile_sdk.sync_request import (
+    MetricRecord,
+    SleepRecord,
+    SyncRequestData,
+    Workout,
+)
+from app.schemas.responses.upload import UploadDataResponse
+from app.services.event_record_service import event_record_service
+from app.services.timeseries_service import timeseries_service
+from app.utils.dates import window_seconds
+from app.utils.structured_logging import get_logger
+from app.utils.units import BloodGlucoseUnit, EnergyUnit, UnitConverter, VolumeUnit
+
+from .condensed_series import drop_condensed_series
+from .device_resolution import extract_device_ids, extract_device_info, extract_device_type
+from .sleep_service import save_sleep
+from .workout_segments import build_workout_segments
+
+logger = get_logger(__name__)
+
+# Energy series stored in kcal.
+_KCAL_SERIES = frozenset({SeriesType.dietary_energy_consumed, SeriesType.dietary_energy_from_fat})
+
+MEAL_CORRELATION_TYPES = frozenset({"HKCorrelationTypeIdentifierFood", "FOOD"})
+
+MEAL_NUTRIENT_SERIES_TYPES = frozenset(
+    {st for st in SeriesType if st.value.startswith("dietary_")} | {SeriesType.hydration}
+)
+
+# First iOS SDK release that sends every `HKUnit.percent()` value on a 0-100 scale.
+# Older builds scale only SpO2 and send the series below as a 0-1 fraction,
+# which the backend scales x100.
+APPLE_SDK_PERCENT_SCALE_MIN_VERSION = Version("0.17.0")
+
+_FRACTION_PERCENT_SERIES = frozenset(
+    {
+        SeriesType.body_fat_percentage,
+        SeriesType.walking_double_support_percentage,
+        SeriesType.walking_asymmetry_percentage,
+        SeriesType.walking_steadiness,
+    }
+)
+
+_SDK_ITEM_MODELS = (("records", MetricRecord), ("sleep", SleepRecord), ("workouts", Workout))
+
+
+def _sends_fraction_percentages(provider: str | None, sdk_version: str | None) -> bool:
+    """Whether percentage values from this SDK arrive as a 0-1 fraction.
+
+    Only iOS SDK builds older than `APPLE_SDK_PERCENT_SCALE_MIN_VERSION` do. A missing or
+    unparseable version is treated as an old build. Pre-releases of the min version count
+    as new, since they are cut after the change.
+    """
+    if provider != "apple":
+        return False
+    try:
+        version = Version(sdk_version or "")
+    except InvalidVersion:
+        return True
+    return version.release < APPLE_SDK_PERCENT_SCALE_MIN_VERSION.release
+
+
+class InvalidRecord(TypedDict):
+    """A single record dropped by per-record validation (PII-free — only the location, no values)."""
+
+    collection: str  # "records" | "sleep" | "workouts"
+    index: int
+    loc: str
+    msg: str | None
+    type: str | None
+
+
+class LoadDataResult(TypedDict):
+    workouts_saved: int
+    meals_saved: int  # meal correlations inserted
+    records_saved: int  # samples submitted
+    records_inserted: int  # rows that did not exist
+    records_updated: int  # rows refreshed in place
+    types: list[str]  # series types written
+    spans: dict[str, tuple[datetime, datetime]]  # per type the device exports itself: record series, workouts, sleep
+    sleep_saved: int
+    dropped: list[InvalidRecord]
+    unsupported_types: dict[str, int]  # record types with no series mapping, skipped
+    validation_ms: float
+
+
+def _parse_sync_request(raw: dict) -> tuple[SDKSyncRequest, list[InvalidRecord]]:
+    """Parse a raw payload into a SyncRequest, salvaging valid records when items fail.
+
+    Fast path validates in one shot. On failure, valid records are kept and the per-item
+    failures returned (PII-free: loc/msg/type). Raises ValidationError when the envelope or
+    a container shape is invalid — nothing salvageable, so the batch is rejected (400).
+    """
+    try:
+        return SDKSyncRequest(**raw), []
+    except ValidationError:
+        pass  # fall through to per-item validation
+
+    # Only individual records are salvageable. A malformed container shape (data not a dict,
+    # or a collection not a list) is not — re-validate to re-raise the real ValidationError.
+    data = raw.get("data")
+    if not isinstance(data, dict) or any(not isinstance(data.get(key, []), list) for key, _ in _SDK_ITEM_MODELS):
+        return SDKSyncRequest(**raw), []
+
+    kept: dict[str, list] = {}
+    dropped: list[InvalidRecord] = []
+    for key, model in _SDK_ITEM_MODELS:
+        good: list = []
+        for idx, item in enumerate(data.get(key, [])):
+            try:
+                good.append(model.model_validate(item))
+            except ValidationError as exc:
+                err = (exc.errors() or [{}])[0]
+                dropped.append(
+                    {
+                        "collection": key,
+                        "index": idx,
+                        "loc": ".".join(str(x) for x in err.get("loc", [])),
+                        "msg": err.get("msg"),
+                        "type": err.get("type"),
+                    }
+                )
+        kept[key] = good
+
+    # Reconstruct via model_validate so Pydantic still rejects a bad envelope; `data` now
+    # carries only the kept records.
+    request = SDKSyncRequest.model_validate(
+        {**raw, "data": SyncRequestData(records=kept["records"], sleep=kept["sleep"], workouts=kept["workouts"])}
+    )
+    return request, dropped
+
+
+class ImportService:
+    def __init__(
+        self,
+    ):
+        self.event_record_service = event_record_service
+        self.timeseries_service = timeseries_service
+        self.user_connection_repo = UserConnectionRepository()
+
+    def _dec(self, value: float | int | Decimal | None) -> Decimal | None:
+        return None if value is None else Decimal(str(value))
+
+    def _build_workout_bundles(
+        self,
+        request: SDKSyncRequest,
+        user_id: str,
+    ) -> Iterable[tuple[EventRecordCreate, EventRecordDetailCreate, list[TimeSeriesSampleCreate]]]:
+        """
+        Given the parsed SDKSyncRequest, yield tuples of
+        (EventRecordCreate, EventRecordDetailCreate) ready to insert into your ORM session.
+        """
+        user_uuid = UUID(user_id)
+        provider = request.provider
+
+        # zoneOffset is optional on the wire, and downstream date derivations
+        # default a missing one to UTC, shifting a non-UTC user's workout by up
+        # to a day. Older SDK builds may not send it, so log the gap instead of
+        # rejecting the batch.
+        missing_offset = sum(1 for wjson in request.data.workouts if not wjson.zoneOffset)
+        if missing_offset:
+            logger.warning(
+                "Workouts missing zoneOffset",
+                action="workout_missing_zone_offset",
+                provider=provider,
+                user_id=user_id,
+                count=missing_offset,
+                total=len(request.data.workouts),
+            )
+
+        for wjson in request.data.workouts:
+            workout_id = uuid4()
+            external_id = wjson.id if wjson.id else None
+
+            device_model, software_version, original_source_name = extract_device_info(wjson.source, provider)
+            device_type = extract_device_type(wjson.source, provider)
+            device_id, source_app_id, device_manufacturer = extract_device_ids(wjson.source)
+
+            metrics, time_series_samples, duration = self._extract_metrics_from_workout_stats(
+                wjson.values,
+                user_uuid,
+                device_model,
+                software_version,
+                wjson.endDate,
+                wjson.zoneOffset,
+                provider,
+                original_source_name,
+                device_type,
+                device_id,
+                source_app_id,
+                device_manufacturer,
+                workout_id,
+            )
+
+            if settings.ingest_workout_samples:
+                time_series_samples.extend(
+                    self._build_workout_route_and_samples(
+                        wjson,
+                        {
+                            "user_id": user_uuid,
+                            "source": original_source_name,
+                            "device_model": device_model,
+                            "software_version": software_version,
+                            "device_type": device_type,
+                            "device_id": device_id,
+                            "source_app_id": source_app_id,
+                            "device_manufacturer": device_manufacturer,
+                            "provider": provider,
+                            "zone_offset": wjson.zoneOffset,
+                        },
+                    )
+                )
+
+            if duration is None:
+                duration = int((wjson.endDate - wjson.startDate).total_seconds())
+
+            workout_type = wjson.type.lower() if wjson.type else None
+            type = get_unified_sdk_workout_type(workout_type).value if workout_type else None
+
+            record = EventRecordCreate(
+                category=EventCategory.WORKOUT,
+                type=type,
+                source_name=original_source_name or "unknown",
+                device_model=device_model,
+                duration_seconds=int(duration),
+                start_datetime=wjson.startDate,
+                end_datetime=wjson.endDate,
+                zone_offset=wjson.zoneOffset,
+                id=workout_id,
+                external_id=external_id,
+                source=original_source_name,
+                software_version=software_version,
+                device_type=device_type,
+                device_id=device_id,
+                source_app_id=source_app_id,
+                device_manufacturer=device_manufacturer,
+                provider=provider,
+                user_id=user_uuid,
+            )
+
+            entry_source = get_unified_sdk_entry_source(wjson.source.recording_method if wjson.source else None)
+            if entry_source is not None:
+                metrics["entry_source"] = entry_source
+
+            detail = EventRecordDetailCreate(
+                record_id=workout_id,
+                segments=build_workout_segments(wjson),
+                **metrics,
+            )
+
+            yield record, detail, time_series_samples
+
+    def _build_workout_route_and_samples(
+        self,
+        wjson: Workout,
+        source_fields: dict[str, Any],
+    ) -> list[TimeSeriesSampleCreate]:
+        """Per-point series from workouts[].route and workouts[].samples.
+
+        Rows share the workout's own data source (`source_fields`), so a re-push upserts
+        on (data_source, series_type, recorded_at) instead of duplicating.
+        Points without a timestamp and sample types with no series mapping are skipped.
+        """
+        result: list[TimeSeriesSampleCreate] = []
+
+        def add(recorded_at: datetime, series_type: SeriesType, value: float) -> None:
+            result.append(
+                TimeSeriesSampleCreate(
+                    id=uuid4(),
+                    **source_fields,
+                    recorded_at=recorded_at,
+                    value=Decimal(str(value)),
+                    series_type=series_type,
+                )
+            )
+
+        for point in wjson.route or []:
+            if point.timestamp is None:
+                continue
+            for field, series_type in WORKOUT_ROUTE_FIELD_TO_SERIES_TYPE.items():
+                value = getattr(point, field)
+                if value is not None:
+                    add(point.timestamp, series_type, value)
+
+        unknown_types: Counter[str] = Counter()
+        unexpected_units: Counter[str] = Counter()
+        for sample in wjson.samples or []:
+            if sample.timestamp is None or sample.value is None:
+                continue
+            sample_type = sample.type or ""
+            if sample_type not in WORKOUT_SAMPLE_TYPES:
+                unknown_types[sample_type] += 1
+                continue
+            series_type, units = WORKOUT_SAMPLE_TYPES[sample_type]
+            unit = (sample.unit or "").strip().lower()
+            if unit and unit not in units:
+                unexpected_units[f"{sample_type}:{unit}"] += 1
+                continue
+            add(sample.timestamp, series_type, sample.value)
+
+        if unknown_types or unexpected_units:
+            logger.debug(
+                "Skipped workout samples with unsupported types or units",
+                workout_id=wjson.id,
+                types=dict(unknown_types),
+                units=dict(unexpected_units),
+            )
+        return result
+
+    def _build_meal_bundles(
+        self,
+        correlation_records: list[MetricRecord],
+        nutrient_records: dict[str, list[MetricRecord]],
+        provider: str,
+        user_id: str,
+    ) -> Generator[tuple[EventRecordCreate, MealDetailCreate]]:
+        """Build meal (EventRecordCreate, MealDetailCreate) pairs from food correlations and their nutrient records."""
+        user_uuid = UUID(user_id)
+
+        for rjson in correlation_records:
+            if not rjson.id:
+                continue
+
+            meal_id = uuid4()
+            metadata = rjson.metadata if isinstance(rjson.metadata, dict) else {}
+            device_model, software_version, original_source_name = extract_device_info(rjson.source, provider)
+            device_id, source_app_id, device_manufacturer = extract_device_ids(rjson.source)
+
+            record = EventRecordCreate(
+                category=EventCategory.MEAL,
+                type=rjson.type,
+                source_name=original_source_name or "unknown",
+                device_model=device_model,
+                start_datetime=rjson.startDate,
+                end_datetime=rjson.endDate,
+                zone_offset=rjson.zoneOffset,
+                id=meal_id,
+                external_id=rjson.id,
+                source=original_source_name,
+                software_version=software_version,
+                device_type=extract_device_type(rjson.source, provider),
+                device_id=device_id,
+                source_app_id=source_app_id,
+                device_manufacturer=device_manufacturer,
+                provider=provider,
+                user_id=user_uuid,
+            )
+            nutrients: dict[SeriesType, float] = {}
+            for sample in self._build_statistic_bundles(nutrient_records.get(rjson.id, []), provider, user_id):
+                nutrients[sample.series_type] = nutrients.get(sample.series_type, 0.0) + float(sample.value)
+            detail = MealDetailCreate(
+                record_id=meal_id,
+                title=metadata.get("title"),
+                meal_type=metadata.get("mealType"),
+                nutrients=nutrients,
+            )
+
+            yield record, detail
+
+    def _normalize_unit(
+        self,
+        series_type: SeriesType,
+        value: Decimal,
+        provider: str | None = None,
+        sdk_version: str | None = None,
+    ) -> Decimal:
+        match series_type:
+            # meters → cm
+            case SeriesType.height | SeriesType.walking_step_length:
+                return value * 100
+            # 0-1 fraction → percent (older iOS SDKs only; Health Connect and newer iOS SDKs send percent)
+            case _ if series_type in _FRACTION_PERCENT_SERIES and _sends_fraction_percentages(provider, sdk_version):
+                return value * 100
+            case _:
+                return value
+
+    def _build_statistic_bundles(
+        self,
+        records: list[MetricRecord],
+        provider: str,
+        user_id: str,
+        sdk_version: str | None = None,
+    ) -> list[HeartRateSampleCreate | StepSampleCreate | TimeSeriesSampleCreate]:
+        time_series_samples: list[HeartRateSampleCreate | StepSampleCreate | TimeSeriesSampleCreate] = []
+        user_uuid = UUID(user_id)
+
+        # See the zoneOffset note in _build_workout_bundles.
+        missing_offset = sum(1 for rjson in records if not rjson.zoneOffset)
+        if missing_offset:
+            logger.warning(
+                "Records missing zoneOffset",
+                action="record_missing_zone_offset",
+                provider=provider,
+                user_id=user_id,
+                count=missing_offset,
+                total=len(records),
+            )
+
+        for rjson in records:
+            record_type = rjson.type or ""
+            value = Decimal(str(rjson.value))
+            unit = (rjson.unit or "").strip().lower()
+
+            series_type = get_series_type_from_metric_type(record_type)
+
+            if not series_type:
+                continue
+            value = self._normalize_unit(series_type, value, provider, sdk_version)
+
+            # Health Connect reports blood glucose in mmol/L; the series unit is mg/dL.
+            if series_type == SeriesType.blood_glucose and unit.startswith("mmol"):
+                value = UnitConverter.blood_glucose(value, BloodGlucoseUnit.mmol_l, BloodGlucoseUnit.mg_dl)
+
+            # Convert hydration units to mL
+            if series_type == SeriesType.hydration and unit in ("l", "liter", "liters", "litre", "litres"):
+                value = UnitConverter.volume(value, VolumeUnit.liter, VolumeUnit.ml)
+
+            # Energy is stored in kcal. Case matters: "cal" is a small calorie (1/1000 kcal),
+            # "Cal" is the food Calorie (= kcal).
+            if series_type in _KCAL_SERIES and (rjson.unit or "").strip() == "cal":
+                value = UnitConverter.energy(value, EnergyUnit.cal, EnergyUnit.kcal)
+
+            # Extract device info
+            device_model, software_version, original_source_name = extract_device_info(rjson.source, provider)
+            device_id, source_app_id, device_manufacturer = extract_device_ids(rjson.source)
+
+            sample = TimeSeriesSampleCreate(
+                id=uuid4(),
+                external_id=rjson.id,
+                user_id=user_uuid,
+                source=original_source_name,
+                device_model=device_model,
+                software_version=software_version,
+                device_type=extract_device_type(rjson.source, provider),
+                device_id=device_id,
+                source_app_id=source_app_id,
+                device_manufacturer=device_manufacturer,
+                provider=provider,
+                recorded_at=rjson.startDate,
+                zone_offset=rjson.zoneOffset,
+                window_seconds=window_seconds(rjson.startDate, rjson.endDate),
+                value=value,
+                series_type=series_type,
+                is_daily_total=daily_total_flag(series_type, is_daily=False),
+            )
+
+            match series_type:
+                case SeriesType.heart_rate:
+                    time_series_samples.append(HeartRateSampleCreate(**sample.model_dump()))
+                case SeriesType.steps:
+                    time_series_samples.append(StepSampleCreate(**sample.model_dump()))
+                case _:
+                    time_series_samples.append(sample)
+
+        return time_series_samples
+
+    def _compute_aggregates(self, values: list[Decimal]) -> tuple[Decimal | None, Decimal | None, Decimal | None]:
+        if not values:
+            return None, None, None
+        min_v = min(values)
+        max_v = max(values)
+        avg_v = sum(values, Decimal("0")) / Decimal(len(values))
+        return min_v, max_v, avg_v
+
+    def _extract_metrics_from_workout_stats(
+        self,
+        stats: list[WorkoutStatistic] | None,
+        user_uuid: UUID,
+        device_model: str | None,
+        software_version: str | None,
+        end_date: datetime,
+        zone_offset: str | None,
+        provider: str,
+        source_name: str | None,
+        device_type: DeviceType | None = None,
+        device_id: str | None = None,
+        source_app_id: str | None = None,
+        device_manufacturer: str | None = None,
+        record_id: UUID | None = None,
+    ) -> tuple[EventRecordMetrics, list[TimeSeriesSampleCreate], int | float | None]:
+        """
+        Returns a tuple with the metrics, time series samples, and duration.
+        """
+        if stats is None:
+            return EventRecordMetrics(), [], None
+
+        stats_dict: dict[str, Decimal | int] = {}
+        detail_field_ranks: dict[str, int] = {}
+        time_series_samples: list[TimeSeriesSampleCreate] = []
+        duration: float | None = None
+        energy_statistics: set[str] = set()
+
+        for stat in stats:
+            value = self._dec(stat.value)
+            if value is None or stat.type is None:
+                continue
+
+            series_type = get_series_type_from_workout_statistic_type(stat.type)
+            if series_type:
+                time_series_samples.append(
+                    TimeSeriesSampleCreate(
+                        id=uuid4(),
+                        external_id=None,
+                        user_id=user_uuid,
+                        source=source_name,
+                        device_model=device_model,
+                        software_version=software_version,
+                        device_type=device_type,
+                        device_id=device_id,
+                        source_app_id=source_app_id,
+                        device_manufacturer=device_manufacturer,
+                        provider=provider,
+                        recorded_at=end_date,
+                        zone_offset=zone_offset,
+                        value=value,
+                        series_type=series_type,
+                        is_daily_total=daily_total_flag(series_type, is_daily=False),
+                        session=SessionValue(record_id=record_id, stat=WORKOUT_STATISTIC_STAT.get(stat.type))
+                        if record_id and series_type not in UNDECIDED_WORKOUT_SERIES
+                        else None,
+                    )
+                )
+                continue
+
+            match stat.type:
+                # duration is sent as a workout statistic but stored separately
+                case WorkoutStatisticType.DURATION | WorkoutStatisticType.TOTAL_DURATION:
+                    duration = float(value) / 1000 if stat.unit == "ms" else float(value)
+                case (
+                    WorkoutStatisticType.ACTIVE_ENERGY_BURNED
+                    | WorkoutStatisticType.BASAL_ENERGY_BURNED
+                    | WorkoutStatisticType.CALORIES
+                    | WorkoutStatisticType.TOTAL_CALORIES
+                ):
+                    # Summed across the energy statistics, and left unset when the payload reports none
+                    energy = stats_dict.get("energy_burned")
+                    stats_dict["energy_burned"] = value if energy is None else energy + value
+                    energy_statistics.add(stat.type)
+                case _:
+                    detail_field = get_detail_field_from_workout_statistic_type(stat.type)
+                    if detail_field:
+                        rank = get_detail_field_precedence(detail_field, stat.type)
+                        if rank > detail_field_ranks.get(detail_field, rank):
+                            continue
+                        detail_field_ranks[detail_field] = rank
+                        # Apple SDK may send fractional Decimals for integer fields (e.g. stepCount)
+                        if detail_field == "steps_count":
+                            value = int(value)
+                        stats_dict[detail_field] = value
+
+        metrics = EventRecordMetrics(**stats_dict)
+        if energy_series := WORKOUT_ENERGY_SERIES.get(frozenset(energy_statistics)):
+            metrics["energy_series"] = energy_series
+        return metrics, time_series_samples, duration
+
+    def load_data(
+        self,
+        db_session: DbSession,
+        raw: dict,
+        user_id: str,
+        batch_id: str | None = None,
+    ) -> LoadDataResult:
+        """
+        Load data into database and return counts of saved items plus per-record failures.
+        """
+        # Per-record validation: keep valid records, drop+report the invalid ones instead
+        # of failing the whole batch. Raises ValidationError only if the envelope is invalid.
+        # validation_ms measures the parse/per-record pass so we can watch the cost of a
+        # malformed payload in the logs.
+        started = time.perf_counter()
+        request, dropped = _parse_sync_request(raw)
+        validation_ms = round((time.perf_counter() - started) * 1000, 1)
+        workouts_saved = 0
+        meals_saved = 0
+        records_saved = 0
+        records_inserted = 0
+        records_updated = 0
+        sleep_saved = 0
+        types: set[str] = set()
+        spans: dict[str, tuple[datetime, datetime]] = {}
+
+        def widen(data_type: str, start: datetime, end: datetime) -> None:
+            held = spans.get(data_type)
+            spans[data_type] = (min(held[0], start), max(held[1], end)) if held else (start, end)
+
+        # A nutrient record whose correlation isn't in this batch stays a loose sample.
+        correlation_records = [r for r in request.data.records if (r.type or "") in MEAL_CORRELATION_TYPES]
+        meal_external_ids = {r.id for r in correlation_records if r.id}
+        nutrient_records: dict[str, list[MetricRecord]] = {}
+        records: list[MetricRecord] = []
+        for rjson in request.data.records:
+            if (rjson.type or "") in MEAL_CORRELATION_TYPES:
+                continue
+            if (
+                rjson.parentId is not None
+                and rjson.parentId in meal_external_ids
+                and get_series_type_from_metric_type(rjson.type or "") in MEAL_NUTRIENT_SERIES_TYPES
+            ):
+                nutrient_records.setdefault(rjson.parentId, []).append(rjson)
+            else:
+                records.append(rjson)
+
+        # Types this backend can't map (e.g. sent by a newer SDK) are skipped while
+        # building samples; count them so the summary log shows what was dropped.
+        unsupported_types = Counter(
+            rjson.type or "" for rjson in records if get_series_type_from_metric_type(rjson.type or "") is None
+        )
+
+        # Process meals in batch
+        meal_bundles = list(self._build_meal_bundles(correlation_records, nutrient_records, request.provider, user_id))
+        if meal_bundles:
+            meals_saved = self.event_record_service.upsert_meals(db_session, meal_bundles)
+
+        # Process workouts in batch
+        workout_bundles = list(self._build_workout_bundles(request, user_id))
+        if workout_bundles:
+            workout_records = [record for record, _, _ in workout_bundles]
+            details_by_id = {detail.record_id: detail for _, detail, _ in workout_bundles}
+            # Bulk create records - returns only IDs that were actually inserted
+            inserted_ids = self.event_record_service.bulk_create(db_session, workout_records)
+            db_session.flush()
+
+            # A workout already stored keeps its own id, so its statistics cannot point at the new one.
+            inserted = set(inserted_ids)
+            time_series_samples = [
+                sample
+                if sample.session is None or sample.session.record_id in inserted
+                else sample.model_copy(update={"session": None})
+                for _, _, samples in workout_bundles
+                for sample in samples
+            ]
+
+            # Filter details to only those records that were actually inserted (avoid FK violation)
+            details_to_insert = [details_by_id[rid] for rid in inserted_ids if rid in details_by_id]
+
+            # Bulk create details (requires event_record to exist due to FK)
+            if details_to_insert:
+                self.event_record_service.bulk_create_details(
+                    db_session, details_to_insert, detail_type=EventCategory.WORKOUT
+                )
+            workouts_saved = len(inserted_ids)
+            for record in workout_records:
+                widen("workouts", record.start_datetime, record.end_datetime)
+
+            # Bulk create time series samples
+            if time_series_samples:
+                counts = self.timeseries_service.bulk_create_samples(db_session, time_series_samples)
+                records_saved += len(time_series_samples)
+                records_inserted += counts.inserted
+                records_updated += counts.updated
+                types.update(sample.series_type.value for sample in time_series_samples)
+
+        # Process time series samples (records)
+        samples = self._build_statistic_bundles(records, request.provider, user_id, request.sdkVersion)
+        # A series HealthKit condensed from samples already stored would count them twice
+        samples = drop_condensed_series(
+            db_session, samples, {r.id: r.count for r in records if r.id and r.count is not None}
+        )
+        if samples:
+            counts = self.timeseries_service.bulk_create_samples(db_session, samples)
+            records_saved += len(samples)
+            records_inserted += counts.inserted
+            records_updated += counts.updated
+            types.update(sample.series_type.value for sample in samples)
+            for sample in samples:
+                widen(sample.series_type.value, sample.recorded_at, sample.recorded_at)
+
+        # Commit all workout and timeseries changes in one transaction
+        db_session.commit()
+
+        # Process sleep (count sleep segments from input)
+        # Sleep a busy lock deferred to a retrying task is not counted as saved here.
+        if request.data.sleep and save_sleep(db_session, request, user_id):
+            sleep_saved = len(request.data.sleep)
+            for segment in request.data.sleep:
+                widen("sleep", segment.startDate, segment.endDate)
+
+        return {
+            "workouts_saved": workouts_saved,
+            "meals_saved": meals_saved,
+            "records_saved": records_saved,
+            "records_inserted": records_inserted,
+            "records_updated": records_updated,
+            "types": sorted(types),
+            "spans": spans,
+            "sleep_saved": sleep_saved,
+            "dropped": dropped,
+            "unsupported_types": dict(unsupported_types),
+            "validation_ms": validation_ms,
+        }
+
+    def import_data_from_request(
+        self,
+        db_session: DbSession,
+        request_content: str,
+        content_type: str,
+        user_id: str,
+        batch_id: str | None = None,
+    ) -> UploadDataResponse:
+        provider = "unknown"
+        try:
+            # Parse content based on type
+            if "multipart/form-data" in content_type:
+                data = self._parse_multipart_content(request_content)
+            else:
+                data = self._parse_json_content(request_content)
+
+            if not data:
+                logger.warning(
+                    "No valid data found in request",
+                    action="sdk_validate_data",
+                    batch_id=batch_id,
+                    user_id=user_id,
+                )
+                return UploadDataResponse(status_code=400, response="No valid data found", user_id=user_id)
+
+            # Extract incoming counts (best-effort; invalid types must reach validation
+            # below rather than raising TypeError here)
+            provider = data.get("provider", "unknown")
+            inner_data = data.get("data")
+            if not isinstance(inner_data, dict):
+                inner_data = {}
+            records = inner_data.get("records")
+            workouts = inner_data.get("workouts")
+            sleep = inner_data.get("sleep")
+            incoming_records = len(records) if isinstance(records, list) else 0
+            incoming_workouts = len(workouts) if isinstance(workouts, list) else 0
+            incoming_sleep = len(sleep) if isinstance(sleep, list) else 0
+
+            # Load data and get saved counts
+            saved_counts = self.load_data(db_session, data, user_id=user_id, batch_id=batch_id)
+
+            connection = self.user_connection_repo.get_by_user_and_provider(db_session, UUID(user_id), provider)
+            if connection:
+                self.user_connection_repo.update_last_synced_at(db_session, connection)
+
+            # Log detailed processing results
+            logger.info(
+                "SDK data import completed",
+                provider=f"{provider}",
+                action=f"{provider}_sdk_import_complete",
+                batch_id=batch_id,
+                user_id=user_id,
+                incoming_records=incoming_records,
+                incoming_workouts=incoming_workouts,
+                incoming_sleep=incoming_sleep,
+                records_saved=saved_counts["records_saved"],
+                records_inserted=saved_counts["records_inserted"],
+                records_updated=saved_counts["records_updated"],
+                workouts_saved=saved_counts["workouts_saved"],
+                sleep_saved=saved_counts["sleep_saved"],
+                unsupported_types=saved_counts["unsupported_types"],
+                validation_ms=saved_counts["validation_ms"],
+            )
+
+            dropped = saved_counts.get("dropped") or []
+            if dropped:
+                # Partial success: some records failed per-record validation. The good
+                # ones are already saved above; report the exact field errors to Sentry
+                # (PII-free: loc/msg/type) so we keep full visibility into what was lost.
+                with sentry_sdk.push_scope() as scope:
+                    scope.set_level("warning")
+                    scope.set_context(
+                        "dropped_records",
+                        {
+                            "batch_id": batch_id,
+                            "user_id": user_id,
+                            "provider": provider,
+                            "dropped_count": len(dropped),
+                            "errors": dropped[:20],
+                        },
+                    )
+                    sentry_sdk.capture_message(f"{provider} SDK payload: dropped invalid records, kept the rest")
+                # Compose the full location (collection[index].field) so the log one-liner
+                # says which record failed, not just the field — the per-record `loc` is
+                # relative to a single record. The full breakdown is in the Sentry context.
+                first = dropped[0]
+                first_loc = f"{first['collection']}[{first['index']}]"
+                if first.get("loc"):
+                    first_loc += f".{first['loc']}"
+                logger.warning(
+                    "SDK dropped invalid records",
+                    provider=f"{provider}",
+                    action=f"{provider}_sdk_records_dropped",
+                    batch_id=batch_id,
+                    user_id=user_id,
+                    dropped_count=len(dropped),
+                    first_error_loc=first_loc,
+                    first_error_msg=first["msg"],
+                )
+
+            return UploadDataResponse(
+                status_code=200,
+                response="Import successful",
+                user_id=user_id,
+                dropped_count=len(dropped),
+                records_saved=saved_counts["records_saved"],
+                records_inserted=saved_counts["records_inserted"],
+                records_updated=saved_counts["records_updated"],
+                types=saved_counts["types"],
+                spans=saved_counts["spans"],
+                workouts_saved=saved_counts["workouts_saved"],
+                meals_saved=saved_counts["meals_saved"],
+                sleep_saved=saved_counts["sleep_saved"],
+            )
+
+        except ValidationError as e:
+            # Reached ONLY when the envelope itself is invalid (provider/sdkVersion/
+            # syncTimestamp/data shape) — _parse_sync_request re-raised because nothing was
+            # salvageable. Per-record failures never reach here: they are collected inside
+            # load_data and handled above as a partial success. Report + 400 the whole batch.
+            errors = e.errors()
+            first = errors[0] if errors else {}
+            # Drop `input` (raw record value — may contain health data/PII) and `url`
+            # before sending to Sentry; keep loc/msg/type. Preserve the 20-error cap.
+            safe_errors = [{k: v for k, v in err.items() if k not in ("input", "url")} for err in errors[:20]]
+            logger.error(
+                "SDK payload validation failed",
+                exc_info=e,
+                provider=provider,
+                action=f"{provider}_sdk_validation_failed",
+                batch_id=batch_id,
+                user_id=user_id,
+                error_count=len(errors),
+                errors=safe_errors,
+                first_error_loc=".".join(str(x) for x in first.get("loc", [])),
+                first_error_msg=first.get("msg"),
+            )
+            return UploadDataResponse(
+                status_code=400,
+                response=f"Validation failed: {first.get('msg', 'invalid payload')}",
+                user_id=user_id,
+            )
+
+        except Exception as e:
+            logger.error(
+                "SDK import failed",
+                exc_info=e,
+                provider=provider,
+                action=f"{provider}_sdk_import_failed",
+                batch_id=batch_id,
+                user_id=user_id,
+            )
+            return UploadDataResponse(
+                status_code=400,
+                response=f"Import failed: {str(e)}",
+                user_id=user_id,
+            )
+
+    def _parse_multipart_content(self, content: str) -> dict | None:
+        """Parse multipart form data to extract JSON."""
+        # Try to find JSON start with various field patterns
+        json_start = content.find('{\n  "data"')
+        if json_start == -1:
+            json_start = content.find('{"data"')
+        if json_start == -1:
+            return None
+
+        brace_count = 0
+        json_end = json_start
+        for i, char in enumerate(content[json_start:], json_start):
+            if char == "{":
+                brace_count += 1
+            elif char == "}":
+                brace_count -= 1
+                if brace_count == 0:
+                    json_end = i
+                    break
+
+        if brace_count != 0:
+            return None
+
+        json_str = content[json_start : json_end + 1]
+        return json.loads(json_str)
+
+    def _parse_json_content(self, content: str) -> dict | None:
+        """Parse JSON content directly."""
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            return None
+
+
+import_service = ImportService()

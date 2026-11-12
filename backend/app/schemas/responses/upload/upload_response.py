@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 
@@ -11,8 +13,19 @@ class UploadDataResponse(BaseModel):
     status_code: int = Field(..., description="HTTP status code (typically 202 for async operations)")
     response: str = Field(..., description="Human-readable response message")
     user_id: str | None = Field(None, description="User ID associated with the import operation")
-    # Set only by the background import, never on the 202 "queued" reply.
-    # process_sdk_upload reads them to decide whether HOS should hear about it.
-    records_saved: int | None = Field(None, description="Samples saved by the import")
-    workouts_saved: int | None = Field(None, description="New workouts saved by the import")
-    sleep_saved: int | None = Field(None, description="Sleep sessions saved by the import")
+    dropped_count: int = Field(0, description="Number of individual records dropped by per-record validation")
+    records_saved: int = Field(0, description="Time-series samples saved")
+    records_inserted: int = Field(0, description="Time-series rows that did not exist before")
+    records_updated: int = Field(0, description="Time-series rows refreshed in place")
+    types: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Canonical SeriesType identifiers written by this batch (e.g. 'heart_rate'), "
+            "sorted. Empty when the batch saved no time-series samples."
+        ),
+    )
+    # Worker-side only: what the batch covered per type, for the run's progress. Never serialized.
+    spans: dict[str, tuple[datetime, datetime]] = Field(default_factory=dict, exclude=True)
+    workouts_saved: int = Field(0, description="Workouts saved")
+    meals_saved: int = Field(0, description="Meal correlations saved")
+    sleep_saved: int = Field(0, description="Sleep records saved")

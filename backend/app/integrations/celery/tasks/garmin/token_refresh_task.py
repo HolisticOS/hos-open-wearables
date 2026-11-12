@@ -14,7 +14,6 @@ reconnect, or Garmin's own deregistration push, is what ends a connection.
 """
 
 from datetime import timedelta
-from logging import getLogger
 from typing import Any
 
 from celery import shared_task
@@ -23,10 +22,9 @@ from app.database import SessionLocal
 from app.repositories import UserConnectionRepository
 from app.schemas.enums import ProviderName
 from app.services.providers.factory import ProviderFactory
-from app.utils.sentry_helpers import log_and_capture_error
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 TASK_NAME = "app.integrations.celery.tasks.garmin.token_refresh_task.refresh_garmin_tokens"
 
@@ -55,21 +53,19 @@ def refresh_garmin_tokens() -> dict[str, Any]:
             if not refresh_token:
                 continue
             try:
-                oauth.refresh_access_token(db, connection.user_id, refresh_token, revoke_on_reject=False)
+                oauth.refresh_access_token(db, connection.user_id, refresh_token, revoke_on_failure=False)
                 refreshed += 1
             except Exception as e:
                 db.rollback()
                 failed += 1
-                log_and_capture_error(
-                    e,
-                    logger,
-                    f"Failed to refresh Garmin token for user {connection.user_id}: {e}",
-                    extra={"user_id": str(connection.user_id), "provider": ProviderName.GARMIN.value},
+                logger.error(
+                    "Failed to refresh Garmin token",
+                    exc_info=e,
+                    user_id=str(connection.user_id),
+                    provider=ProviderName.GARMIN.value,
                 )
 
-    log_structured(
-        logger,
-        "info",
+    logger.info(
         "Garmin token refresh run complete",
         provider=ProviderName.GARMIN.value,
         candidates=len(connections),

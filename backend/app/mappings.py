@@ -2,7 +2,7 @@ from decimal import Decimal
 from typing import Annotated, Any, TypeVar
 from uuid import UUID
 
-from sqlalchemy import ForeignKey, Numeric, String
+from sqlalchemy import ForeignKey, Numeric, String, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import mapped_column
 
@@ -24,6 +24,10 @@ type OneToOne[T] = T
 
 # Custom types
 json_binary = Annotated[list[dict[str, Any]], mapped_column(JSONB)]
+json_object = Annotated[dict[str, Any], mapped_column(JSONB)]
+int_zero = Annotated[int, mapped_column(server_default=text("0"))]
+bool_true = Annotated[bool, mapped_column(server_default=text("true"))]
+bool_false = Annotated[bool, mapped_column(server_default=text("false"))]
 email = Annotated[str, mapped_column(String)]
 str_10 = Annotated[str, mapped_column(String(10))]
 str_32 = Annotated[str, mapped_column(String(32))]
@@ -36,17 +40,21 @@ numeric_6_3 = Annotated[Decimal, mapped_column(Numeric(6, 3))]
 numeric_10_3 = Annotated[Decimal, mapped_column(Numeric(10, 3))]
 numeric_10_2 = Annotated[Decimal, mapped_column(Numeric(10, 2))]
 numeric_15_5 = Annotated[Decimal, mapped_column(Numeric(15, 5))]
+numeric_unbounded = Annotated[Decimal, mapped_column(Numeric)]
+# Values written to the unbounded columns are rounded here: GPS keeps ~1 cm, float noise stays out of the rows.
+SERIES_VALUE_SCALE = 7
 
 # Custom foreign keys
 FKDeveloper = Annotated[UUID, mapped_column(ForeignKey("developer.id", ondelete="SET NULL"))]
+FKApplication = Annotated[UUID, mapped_column(ForeignKey("application.id", ondelete="CASCADE"))]
 FKUser = Annotated[UUID, mapped_column(ForeignKey("user.id", ondelete="CASCADE"))]
 FKEventRecord = Annotated[
     UUID,
     mapped_column(ForeignKey("event_record.id", ondelete="CASCADE"), primary_key=True),
 ]
-FKEventRecordDetail = Annotated[
+FKEventRecordRef = Annotated[
     UUID,
-    mapped_column(ForeignKey("event_record_detail.record_id", ondelete="CASCADE"), primary_key=True),
+    mapped_column(ForeignKey("event_record.id", ondelete="CASCADE")),
 ]
 FKDataSource = Annotated[
     UUID,
@@ -59,4 +67,8 @@ FKUserConnection = Annotated[
 FKSeriesTypeDefinition = Annotated[
     int,
     mapped_column(ForeignKey("series_type_definition.id", ondelete="RESTRICT")),
+]
+FKSyncRun = Annotated[
+    UUID,
+    mapped_column(ForeignKey("sync_run.id", ondelete="CASCADE"), primary_key=True),
 ]

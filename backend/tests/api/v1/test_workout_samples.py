@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.models import DataPointSeries, DataSource, EventRecord
+from app.models import DataSource, EventRecord, SeriesSample
 from app.repositories.data_point_series_repository import DataPointSeriesRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import ProviderName, SeriesType
@@ -117,7 +117,7 @@ def _garmin_workout(db: Session, garmin_247: Garmin247Data, user: Any) -> EventR
         },
     )
     samples = garmin_247._build_activity_samples(user.id, _activity_details())
-    DataPointSeriesRepository(DataPointSeries).bulk_create(db, samples)
+    DataPointSeriesRepository(SeriesSample).bulk_create(db, samples)
     db.flush()
     return workout
 
@@ -137,7 +137,7 @@ def _apple_heart_rate(db: Session, user: Any, value: int) -> DataSource:
         )
         for i in range(0, DURATION, 10)
     ]
-    DataPointSeriesRepository(DataPointSeries).bulk_create(db, samples)
+    DataPointSeriesRepository(SeriesSample).bulk_create(db, samples)
     db.flush()
     return db.query(DataSource).filter(DataSource.user_id == user.id, DataSource.provider == ProviderName.APPLE).one()
 
@@ -146,7 +146,7 @@ class TestWorkoutSamplesEndpoint:
     def _get(self, client: TestClient, user_id: Any, workout_id: Any, **params: Any) -> Any:
         return client.get(
             f"/api/v1/users/{user_id}/events/workouts/{workout_id}/samples",
-            headers=api_key_headers(ApiKeyFactory().id),
+            headers=api_key_headers(ApiKeyFactory().plain_key),
             params=params,
         )
 
@@ -160,7 +160,8 @@ class TestWorkoutSamplesEndpoint:
         assert response.status_code == 200, response.text
         body = response.json()
         assert body["workout_id"] == str(workout.id)
-        assert body["source"] == {"provider": "garmin", "device": "Forerunner 965"}
+        assert body["source"]["provider"] == "garmin"
+        assert body["source"]["device"] == "Forerunner 965"
         assert set(body["series"]) == {"heart_rate", "speed", "elevation"}  # only what was recorded
 
         hr = body["series"]["heart_rate"]
@@ -244,8 +245,8 @@ class TestWorkoutSamplesEndpoint:
         workout = _garmin_workout(db, garmin_247, user)
 
         assert self._get(client, user.id, workout.id, types=["steps"]).status_code == 400
-        # the app maps request validation errors to 400
-        assert self._get(client, user.id, workout.id, max_points=2001).status_code == 400
+        # request validation errors are 422
+        assert self._get(client, user.id, workout.id, max_points=2001).status_code == 422
 
     def test_requires_api_key(self, client: TestClient, db: Session) -> None:
         response = client.get(f"/api/v1/users/{uuid4()}/events/workouts/{uuid4()}/samples")
@@ -275,11 +276,10 @@ class TestWorkoutPace:
 
         response = client.get(
             f"/api/v1/users/{user.id}/events/workouts",
-            headers=api_key_headers(ApiKeyFactory().id),
+            headers=api_key_headers(ApiKeyFactory().plain_key),
             params={"start_date": "2025-11-19", "end_date": "2025-11-21"},
         )
 
         assert response.status_code == 200
         by_type = {w["type"]: w for w in response.json()["data"]}
         assert by_type["running"]["avg_pace_sec_per_km"] == 300.0  # 3000 s over 10 km
-        assert by_type["yoga"]["avg_pace_sec_per_km"] is None

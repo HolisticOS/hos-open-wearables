@@ -6,8 +6,9 @@ class ProviderName(str, Enum):
 
     APPLE = "apple"
     SAMSUNG = "samsung"
-    GOOGLE = "google"
     GARMIN = "garmin"
+    HEALTH_CONNECT = "health_connect"
+    GOOGLE_HEALTH = "google_health"
     POLAR = "polar"
     SUUNTO = "suunto"
     WHOOP = "whoop"
@@ -15,6 +16,8 @@ class ProviderName(str, Enum):
     OURA = "oura"
     FITBIT = "fitbit"
     ULTRAHUMAN = "ultrahuman"
+    SENSORBIO = "sensorbio"
+    WITHINGS = "withings"
     UNKNOWN = "unknown"
     INTERNAL = "internal"
 
@@ -43,9 +46,10 @@ class ProviderName(str, Enum):
 
 
 # Lower = preferred. A wearable the user connected (its own cloud account) beats the
-# phone's health store: Apple Health, Samsung Health and Health Connect also hold copies
-# of whatever other apps wrote into them, so they are the fallback for days and metrics
-# the wearable has nothing for. Rows in provider_priority override these.
+# phone's health store: Apple Health, Samsung Health, Health Connect and Google Health
+# also hold copies of whatever other apps wrote into them, so they are the fallback for
+# days and metrics the wearable has nothing for. Rows in provider_priority override these.
+# UNKNOWN and INTERNAL are deliberately absent because they are not configurable.
 DEFAULT_PROVIDER_PRIORITY: dict[ProviderName, int] = {
     ProviderName.GARMIN: 1,
     ProviderName.POLAR: 2,
@@ -55,7 +59,10 @@ DEFAULT_PROVIDER_PRIORITY: dict[ProviderName, int] = {
     ProviderName.FITBIT: 6,
     ProviderName.ULTRAHUMAN: 7,
     ProviderName.STRAVA: 8,
+    ProviderName.WITHINGS: 9,
+    ProviderName.SENSORBIO: 10,
     ProviderName.APPLE: 20,
     ProviderName.SAMSUNG: 21,
-    ProviderName.GOOGLE: 22,
+    ProviderName.HEALTH_CONNECT: 22,
+    ProviderName.GOOGLE_HEALTH: 23,
 }

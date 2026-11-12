@@ -3,7 +3,6 @@
 Queued by :func:`app.services.provider_data_deletion.schedule_provider_data_deletion`.
 """
 
-from logging import getLogger
 from typing import Any
 from uuid import UUID
 
@@ -11,9 +10,9 @@ from celery import Task, shared_task
 
 from app.database import SessionLocal
 from app.services import provider_data_deletion
-from app.utils.structured_logging import log_structured
+from app.utils.structured_logging import get_logger
 
-logger = getLogger(__name__)
+logger = get_logger(__name__)
 
 
 @shared_task(
@@ -30,9 +29,7 @@ def delete_provider_data(self: Task, user_id: str, provider: str) -> dict[str, A
         with SessionLocal() as db:
             result = provider_data_deletion.delete_provider_data(db, UUID(user_id), provider)
     except Exception as exc:
-        log_structured(
-            logger,
-            "error",
+        logger.error(
             "Provider data deletion failed, scheduling retry",
             provider=provider,
             user_id=user_id,

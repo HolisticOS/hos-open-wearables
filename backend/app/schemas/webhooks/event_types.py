@@ -35,10 +35,19 @@ class WebhookEventType(StrEnum):
     SYNC_FAILED = "sync.failed"
 
     # -------------------------------------------------------------------------
+    # Per-data-type sync outcomes (one per data type within a run)
+    # Subscribe to learn when a single type's history is fully in, rather than
+    # waiting for the whole run.
+    # -------------------------------------------------------------------------
+    SYNC_DATA_TYPE_COMPLETED = "sync.data_type.completed"
+    SYNC_DATA_TYPE_FAILED = "sync.data_type.failed"
+
+    # -------------------------------------------------------------------------
     # EventRecord-based (discrete sessions)
     # -------------------------------------------------------------------------
     WORKOUT_CREATED = "workout.created"
     SLEEP_CREATED = "sleep.created"
+    MEAL_CREATED = "meal.created"
     MENSTRUAL_CYCLE_CREATED = "menstrual_cycle.created"
 
     # -------------------------------------------------------------------------
@@ -72,7 +81,7 @@ class WebhookEventType(StrEnum):
     SERIES_HEART_RATE = "series.heart_rate.created"
     SERIES_RESTING_HEART_RATE = "series.resting_heart_rate.created"
     SERIES_HEART_RATE_RECOVERY_ONE_MINUTE = "series.heart_rate_recovery_one_minute.created"
-    SERIES_WALKING_HEART_RATE_AVERAGE = "series.walking_heart_rate_average.created"
+    SERIES_WALKING_HEART_RATE = "series.walking_heart_rate.created"
     SERIES_ATRIAL_FIBRILLATION_BURDEN = "series.atrial_fibrillation_burden.created"
 
     # HRV
@@ -111,6 +120,9 @@ class WebhookEventType(StrEnum):
     SERIES_LEAN_BODY_MASS = "series.lean_body_mass.created"
     SERIES_BODY_FAT_MASS = "series.body_fat_mass.created"
     SERIES_SKELETAL_MUSCLE_MASS = "series.skeletal_muscle_mass.created"
+    SERIES_BONE_MASS = "series.bone_mass.created"
+    SERIES_BODY_WATER_MASS = "series.body_water_mass.created"
+    SERIES_BODY_WATER_PERCENTAGE = "series.body_water_percentage.created"
     SERIES_WAIST_CIRCUMFERENCE = "series.waist_circumference.created"
 
     # Body temperature
@@ -132,15 +144,15 @@ class WebhookEventType(StrEnum):
 
     # Steps & calories
     SERIES_STEPS = "series.steps.created"
-    SERIES_ENERGY = "series.energy.created"
+    SERIES_ACTIVE_ENERGY = "series.active_energy.created"
     SERIES_BASAL_ENERGY = "series.basal_energy.created"
+    SERIES_TOTAL_ENERGY = "series.total_energy.created"
 
     # Activity basic
     SERIES_STAND_TIME = "series.stand_time.created"
     SERIES_EXERCISE_TIME = "series.exercise_time.created"
     SERIES_PHYSICAL_EFFORT = "series.physical_effort.created"
     SERIES_FLIGHTS_CLIMBED = "series.flights_climbed.created"
-    SERIES_AVERAGE_MET = "series.average_met.created"
     SERIES_ACTIVE_TIME = "series.active_time.created"
     SERIES_INTENSITY_MINUTES_MODERATE = "series.intensity_minutes_moderate.created"
     SERIES_INTENSITY_MINUTES_VIGOROUS = "series.intensity_minutes_vigorous.created"
@@ -193,16 +205,27 @@ class WebhookEventType(StrEnum):
 # Human-readable descriptions shown in the Svix dashboard and event-types endpoint
 EVENT_TYPE_DESCRIPTIONS: dict[WebhookEventType, str] = {
     # Session events
-    WebhookEventType.CONNECTION_CREATED: "A user successfully connected a wearable provider.",
+    WebhookEventType.CONNECTION_CREATED: (
+        "A user successfully connected a wearable provider. SDK providers fire on the first upload, "
+        "including when a revoked connection resumes uploading."
+    ),
     WebhookEventType.CONNECTION_REVOKED: (
-        "A provider connection became invalid (refresh token expired/revoked, or the user "
-        "deregistered on the provider side). The user must re-authorize to resume syncing."
+        "A provider connection became invalid or was disconnected (see reason). "
+        "OAuth connections need re-authorization; SDK connections resume on the next upload."
     ),
     WebhookEventType.SYNC_STARTED: "A sync run started for a user (live, historical, backfill, SDK or XML).",
     WebhookEventType.SYNC_COMPLETED: "A sync run completed successfully (terminal state).",
     WebhookEventType.SYNC_FAILED: "A sync run failed (terminal state, includes error message).",
+    WebhookEventType.SYNC_DATA_TYPE_COMPLETED: (
+        "One data type finished within a sync run. On a historical run this is the signal that "
+        "the type's backfill is in; the payload carries the range now held for it."
+    ),
+    WebhookEventType.SYNC_DATA_TYPE_FAILED: (
+        "One data type failed or was lost within a sync run, while others may have succeeded."
+    ),
     WebhookEventType.WORKOUT_CREATED: "A new workout session was saved.",
     WebhookEventType.SLEEP_CREATED: "A new (or merged) sleep session was saved.",
+    WebhookEventType.MEAL_CREATED: "A new meal or nutrition-log entry was saved.",
     WebhookEventType.MENSTRUAL_CYCLE_CREATED: "A new menstrual cycle record was saved.",
     # Group events
     WebhookEventType.HEART_RATE_CREATED: "Any heart-rate samples (all HR variants) were ingested.",
@@ -231,7 +254,7 @@ EVENT_TYPE_DESCRIPTIONS: dict[WebhookEventType, str] = {
     WebhookEventType.SERIES_HEART_RATE: "Continuous heart-rate samples were ingested.",
     WebhookEventType.SERIES_RESTING_HEART_RATE: "Resting heart-rate samples were ingested.",
     WebhookEventType.SERIES_HEART_RATE_RECOVERY_ONE_MINUTE: "1-minute heart-rate recovery samples were ingested.",
-    WebhookEventType.SERIES_WALKING_HEART_RATE_AVERAGE: "Walking heart-rate average samples were ingested.",
+    WebhookEventType.SERIES_WALKING_HEART_RATE: "Walking heart-rate samples were ingested.",
     WebhookEventType.SERIES_ATRIAL_FIBRILLATION_BURDEN: "Atrial fibrillation burden samples were ingested.",
     WebhookEventType.SERIES_HEART_RATE_VARIABILITY_SDNN: "HRV SDNN samples were ingested.",
     WebhookEventType.SERIES_HEART_RATE_VARIABILITY_RMSSD: "HRV RMSSD samples were ingested.",
@@ -256,6 +279,9 @@ EVENT_TYPE_DESCRIPTIONS: dict[WebhookEventType, str] = {
     WebhookEventType.SERIES_LEAN_BODY_MASS: "Lean body mass samples were ingested.",
     WebhookEventType.SERIES_BODY_FAT_MASS: "Body fat mass samples were ingested.",
     WebhookEventType.SERIES_SKELETAL_MUSCLE_MASS: "Skeletal muscle mass samples were ingested.",
+    WebhookEventType.SERIES_BONE_MASS: "Bone mass samples were ingested.",
+    WebhookEventType.SERIES_BODY_WATER_MASS: "Body water mass samples were ingested.",
+    WebhookEventType.SERIES_BODY_WATER_PERCENTAGE: "Body water percentage samples were ingested.",
     WebhookEventType.SERIES_WAIST_CIRCUMFERENCE: "Waist circumference samples were ingested.",
     WebhookEventType.SERIES_BODY_TEMPERATURE: "Core body temperature samples were ingested.",
     WebhookEventType.SERIES_SKIN_TEMPERATURE: "Skin temperature samples were ingested.",
@@ -271,13 +297,17 @@ EVENT_TYPE_DESCRIPTIONS: dict[WebhookEventType, str] = {
     WebhookEventType.SERIES_CARDIOVASCULAR_AGE: "Cardiovascular age samples were ingested.",
     WebhookEventType.SERIES_GARMIN_FITNESS_AGE: "Garmin fitness age estimates were ingested.",
     WebhookEventType.SERIES_STEPS: "Step count samples were ingested.",
-    WebhookEventType.SERIES_ENERGY: "Active energy (calories) samples were ingested.",
+    WebhookEventType.SERIES_ACTIVE_ENERGY: (
+        "Active energy (calories) samples were ingested. Not total energy - basal is a separate series and event."
+    ),
     WebhookEventType.SERIES_BASAL_ENERGY: "Basal energy samples were ingested.",
+    WebhookEventType.SERIES_TOTAL_ENERGY: (
+        "Total energy (active + basal) samples were ingested, from providers that don't split the two."
+    ),
     WebhookEventType.SERIES_STAND_TIME: "Stand time samples were ingested.",
     WebhookEventType.SERIES_EXERCISE_TIME: "Exercise time samples were ingested.",
     WebhookEventType.SERIES_PHYSICAL_EFFORT: "Physical effort samples were ingested.",
     WebhookEventType.SERIES_FLIGHTS_CLIMBED: "Flights climbed samples were ingested.",
-    WebhookEventType.SERIES_AVERAGE_MET: "Average MET samples were ingested.",
     WebhookEventType.SERIES_ACTIVE_TIME: "Active time samples were ingested.",
     WebhookEventType.SERIES_INTENSITY_MINUTES_MODERATE: "Moderate intensity minutes samples were ingested.",
     WebhookEventType.SERIES_INTENSITY_MINUTES_VIGOROUS: "Vigorous intensity minutes samples were ingested.",
@@ -330,7 +360,7 @@ EVENT_TYPE_GROUPS: dict[str, list[str]] = {
         WebhookEventType.SERIES_HEART_RATE,
         WebhookEventType.SERIES_RESTING_HEART_RATE,
         WebhookEventType.SERIES_HEART_RATE_RECOVERY_ONE_MINUTE,
-        WebhookEventType.SERIES_WALKING_HEART_RATE_AVERAGE,
+        WebhookEventType.SERIES_WALKING_HEART_RATE,
         WebhookEventType.SERIES_ATRIAL_FIBRILLATION_BURDEN,
     ],
     WebhookEventType.HEART_RATE_VARIABILITY_CREATED: [
@@ -369,6 +399,9 @@ EVENT_TYPE_GROUPS: dict[str, list[str]] = {
         WebhookEventType.SERIES_LEAN_BODY_MASS,
         WebhookEventType.SERIES_BODY_FAT_MASS,
         WebhookEventType.SERIES_SKELETAL_MUSCLE_MASS,
+        WebhookEventType.SERIES_BONE_MASS,
+        WebhookEventType.SERIES_BODY_WATER_MASS,
+        WebhookEventType.SERIES_BODY_WATER_PERCENTAGE,
         WebhookEventType.SERIES_WAIST_CIRCUMFERENCE,
     ],
     WebhookEventType.BODY_TEMPERATURE_CREATED: [
@@ -392,15 +425,15 @@ EVENT_TYPE_GROUPS: dict[str, list[str]] = {
         WebhookEventType.SERIES_STEPS,
     ],
     WebhookEventType.CALORIES_CREATED: [
-        WebhookEventType.SERIES_ENERGY,
+        WebhookEventType.SERIES_ACTIVE_ENERGY,
         WebhookEventType.SERIES_BASAL_ENERGY,
+        WebhookEventType.SERIES_TOTAL_ENERGY,
     ],
     WebhookEventType.ACTIVITY_CREATED_TIMESERIES: [
         WebhookEventType.SERIES_STAND_TIME,
         WebhookEventType.SERIES_EXERCISE_TIME,
         WebhookEventType.SERIES_PHYSICAL_EFFORT,
         WebhookEventType.SERIES_FLIGHTS_CLIMBED,
-        WebhookEventType.SERIES_AVERAGE_MET,
         WebhookEventType.SERIES_ACTIVE_TIME,
         WebhookEventType.SERIES_INTENSITY_MINUTES_MODERATE,
         WebhookEventType.SERIES_INTENSITY_MINUTES_VIGOROUS,

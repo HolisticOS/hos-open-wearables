@@ -39,7 +39,7 @@ def _ep_to_response(ep: EndpointOut) -> EndpointResponse:
         id=ep.id,
         url=ep.url,
         description=ep.description,
-        filter_types=ep.filter_types,
+        filter_types=ep.event_types,
         user_id=svix_service.user_id_from_endpoint(ep),
     )
 
@@ -49,7 +49,7 @@ def _svix_app_id(developer: DeveloperDep) -> str:
     if not svix_service.is_enabled():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Outgoing webhooks are not configured (set SVIX_JWT_SECRET or SVIX_AUTH_TOKEN).",
+            detail="Outgoing webhooks are not enabled (set OUTGOING_WEBHOOKS_ENABLED=true in the backend environment).",
         )
     return svix_service.ensure_application(str(developer.id), developer.email)
 
@@ -71,8 +71,7 @@ def create_endpoint(body: EndpointCreateRequest, app_id: SvixAppId) -> EndpointR
 
 @router.get("/endpoints")
 def list_endpoints(app_id: SvixAppId) -> list[EndpointResponse]:
-    result = svix_service.list_endpoints(app_id)
-    return [_ep_to_response(ep) for ep in result.data]
+    return [_ep_to_response(ep) for ep in svix_service.iter_endpoints(app_id)]
 
 
 @router.get("/endpoints/{endpoint_id}")
@@ -172,6 +171,7 @@ def list_endpoint_attempts(
         after=after,
         status=MessageStatus(status) if status is not None else None,
         event_types=event_types,
+        with_content=True,
     )
     result = svix_service.list_message_attempts(app_id, endpoint_id, options)
 

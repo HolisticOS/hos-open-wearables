@@ -1,17 +1,17 @@
 """Per-workout samples for a workout detail view: downsampled series, route, laps and zones."""
 
 from datetime import datetime, timedelta
-from logging import Logger, getLogger
 from typing import Any
 from uuid import UUID
 
 from app.database import DbSession
-from app.models import DataPointSeries, EventRecord, WorkoutDetails
+from app.models import EventRecord, SeriesSample, WorkoutDetails
 from app.repositories import DataPointSeriesRepository, DataSourceRepository, EventRecordRepository
-from app.repositories.data_point_series_repository import WorkoutWindow
+from app.repositories.data_point_series_repository import WorkoutSampleWindow
 from app.schemas.enums import (
     GPS_STORAGE_SERIES,
     SCALED_GPS_SERIES,
+    EventCategory,
     SeriesType,
     get_series_type_from_id,
     get_series_type_id,
@@ -27,6 +27,7 @@ from app.schemas.responses.activity import (
     WorkoutSet,
 )
 from app.schemas.utils import SourceMetadata
+from app.utils.structured_logging import StructuredLogger, get_logger
 
 # Series a workout detail view can ask for. Latitude/longitude form the route, the rest are averaged.
 WORKOUT_SAMPLE_TYPES: tuple[SeriesType, ...] = (
@@ -52,11 +53,11 @@ _LAP_KEY_RENAMES: dict[str, str] = {
 
 
 class WorkoutSamplesService:
-    def __init__(self, log: Logger):
+    def __init__(self, log: StructuredLogger):
         self.logger = log
         self.event_record_repo = EventRecordRepository(EventRecord)
         self.data_source_repo = DataSourceRepository()
-        self.data_point_repo = DataPointSeriesRepository(DataPointSeries)
+        self.data_point_repo = DataPointSeriesRepository(SeriesSample)
 
     def get_workout_samples(
         self,
@@ -67,7 +68,7 @@ class WorkoutSamplesService:
         max_points: int,
     ) -> WorkoutSamples | None:
         """Samples, route, laps and zones of one workout, or None when it is not the user's workout."""
-        record = self.event_record_repo.get_record_with_details(db_session, workout_id, "workout")
+        record = self.event_record_repo.get_record_with_details(db_session, workout_id, EventCategory.WORKOUT)
         if record is None or record.data_source_id is None:
             return None
         data_source = self.data_source_repo.get(db_session, record.data_source_id)
@@ -80,7 +81,7 @@ class WorkoutSamplesService:
         route_ids = [get_series_type_id(st) for t in requested if t in ROUTE_TYPES for st in (GPS_STORAGE_SERIES[t], t)]
         all_ids = numeric_ids + route_ids
 
-        window = WorkoutWindow(
+        window = WorkoutSampleWindow(
             user_id=user_id,
             start=record.start_datetime,
             end=record.end_datetime,
@@ -91,7 +92,7 @@ class WorkoutSamplesService:
         # Samples linked to the workout's own data source win; otherwise fall back to the
         # provider's other sources (Garmin stores workout samples on its device-less source).
         if all_ids and not self.data_point_repo.has_samples_in_window(db_session, window, all_ids):
-            window = WorkoutWindow(
+            window = WorkoutSampleWindow(
                 user_id=user_id,
                 start=record.start_datetime,
                 end=record.end_datetime,
@@ -119,12 +120,18 @@ class WorkoutSamplesService:
                 max_points,
             )
 
-        details = record.detail if isinstance(record.detail, WorkoutDetails) else None
+        details = record.workout_detail
         return WorkoutSamples(
             workout_id=record.id,
             start_time=record.start_datetime,
             end_time=record.end_datetime,
-            source=SourceMetadata(provider=data_source.source or "unknown", device=data_source.device_model),
+            source=SourceMetadata(
+                provider=data_source.provider or "unknown",
+                source=data_source.source,
+                device=data_source.device_model,
+                device_type=data_source.device_type,
+                device_id=data_source.device_id,
+            ),
             series=series,
             route=route,
             laps=self._laps(details.segments if details else None),
@@ -219,4 +226,4 @@ class WorkoutSamplesService:
         return zones
 
 
-workout_samples_service = WorkoutSamplesService(log=getLogger(__name__))
+workout_samples_service = WorkoutSamplesService(log=get_logger(__name__))

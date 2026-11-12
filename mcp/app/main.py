@@ -8,6 +8,7 @@ from fastmcp import FastMCP
 from app.config import settings
 from app.prompts import prompts_router
 from app.tools.activity import activity_router
+from app.tools.menstrual_cycles import menstrual_cycles_router
 from app.tools.sleep import sleep_router
 from app.tools.timeseries import timeseries_router
 from app.tools.users import users_router
@@ -36,7 +37,9 @@ mcp = FastMCP(
     - get_activity_summary: Get daily activity data (steps, calories, heart rate, intensity minutes)
     - get_sleep_summary: Get sleep data for a user over a specified time period
     - get_workout_events: Get workout/exercise data for a user over a specified time period
-    - get_timeseries: Get granular time-series samples (e.g. weight, SpO2, HRV, intraday heart rate)
+    - get_timeseries: Get time-series samples (intraday heart rate, weight) and, at resolution "1day",
+      day values (resting HR, SpO2, HRV, VO2 max)
+    - get_menstrual_cycles: Get menstrual cycle records (cycle day, phase, period and cycle lengths)
 
     Available prompts:
     - present_health_data: Guidelines for formatting health data for human readability
@@ -118,6 +121,7 @@ mcp.mount(activity_router)
 mcp.mount(sleep_router)
 mcp.mount(workouts_router)
 mcp.mount(timeseries_router)
+mcp.mount(menstrual_cycles_router)
 
 # Mount prompts
 mcp.mount(prompts_router)

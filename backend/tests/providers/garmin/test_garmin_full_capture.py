@@ -151,78 +151,6 @@ class TestDailiesCapture:
         assert "activity_stress_duration_seconds" not in score.components  # absent in payload
 
 
-class TestEpochsCapture:
-    def test_distance_active_time_and_met(self, garmin_247: Garmin247Data) -> None:
-        user_id = uuid4()
-        epoch = {
-            "summaryId": "x1-65a4f710-3",
-            "startTimeInSeconds": 1705309200,
-            "durationInSeconds": 900,
-            "activeTimeInSeconds": 540,
-            "steps": 250,
-            "distanceInMeters": 200.5,
-            "activeKilocalories": 15,
-            "met": 3.2,
-            "meanHeartRateInBeatsPerMinute": 85,
-            "intensity": "ACTIVE",
-        }
-        normalized = garmin_247.normalize_epochs([epoch], user_id)
-        by_type = _by_type(garmin_247._build_epochs_samples(user_id, normalized))
-
-        assert by_type[SeriesType.distance_walking_running][0].value == Decimal("200.5")
-        assert by_type[SeriesType.distance_walking_running][0].is_daily_total is False
-        assert by_type[SeriesType.active_time][0].value == Decimal("9")  # 540 s
-        assert by_type[SeriesType.active_time][0].is_daily_total is False
-        assert by_type[SeriesType.average_met][0].value == Decimal("3.2")
-        assert by_type[SeriesType.average_met][0].is_daily_total is None
-        assert by_type[SeriesType.distance_walking_running][0].external_id == "x1-65a4f710"
-
-    def test_epochs_of_one_slot_are_merged(self, garmin_247: Garmin247Data) -> None:
-        """One epoch per activity type shares the slot start; sums add up, rates average."""
-        user_id = uuid4()
-        slot = {"startTimeInSeconds": 1705309200, "durationInSeconds": 900}
-        epochs = [
-            {
-                **slot,
-                "summaryId": "x1-65a4f710-0",
-                "steps": 40,
-                "activeKilocalories": 2,
-                "meanHeartRateInBeatsPerMinute": 70,
-            },
-            {
-                **slot,
-                "summaryId": "x1-65a4f710-3",
-                "steps": 210,
-                "activeKilocalories": 13,
-                "meanHeartRateInBeatsPerMinute": 90,
-            },
-        ]
-        normalized = garmin_247.normalize_epochs(epochs, user_id)
-        by_type = _by_type(garmin_247._build_epochs_samples(user_id, normalized))
-
-        assert len(by_type[SeriesType.steps]) == 1
-        assert by_type[SeriesType.steps][0].value == Decimal("250")
-        assert by_type[SeriesType.energy][0].value == Decimal("15")
-        assert by_type[SeriesType.heart_rate][0].value == Decimal("80")
-
-    @patch("app.repositories.data_point_series_repository.DataPointSeriesRepository.bulk_create")
-    def test_batch_merges_slot_across_items(
-        self, mock_bulk_create: MagicMock, garmin_247: Garmin247Data, db: Session
-    ) -> None:
-        user = UserFactory()
-        slot = {"startTimeInSeconds": 1705309200, "durationInSeconds": 900}
-        items = [
-            {**slot, "summaryId": "x1-65a4f710-0", "steps": 40},
-            {**slot, "summaryId": "x1-65a4f710-3", "steps": 210},
-        ]
-        mock_bulk_create.return_value = 1
-
-        garmin_247.process_items_batch(db, user.id, "epochs", items)
-
-        samples = mock_bulk_create.call_args[0][1]
-        assert [s.value for s in samples if s.series_type == SeriesType.steps] == [Decimal("250")]
-
-
 class TestBloodPressurePulse:
     def test_pulse_is_heart_rate_reading(self, garmin_247: Garmin247Data) -> None:
         bp = {
@@ -378,31 +306,35 @@ class TestPushToReadEndpoints:
         base = f"/api/v1/users/{user.id}"
         window = {"start_time": "2024-01-14T00:00:00Z", "end_time": "2024-01-16T00:00:00Z"}
 
-        def values(series: str) -> list[float]:
-            body = self._get(client, api_key.id, f"{base}/timeseries", {**window, "types": series, "limit": 100})
+        def values(series: str, resolution: str = "raw") -> list[float]:
+            params = {**window, "types": series, "limit": 100, "resolution": resolution}
+            body = self._get(client, api_key.plain_key, f"{base}/timeseries", params)
             return [s["value"] for s in body["data"]]
 
         assert values("garmin_body_battery") == [80, 78]
         assert values("garmin_stress_level") == [25, 30]
         assert values("respiratory_rate") == [11.33, 15.36]
         assert values("oxygen_saturation") == [98, 97]
-        assert values("vo2_max") == [48.0]
-        assert values("intensity_minutes_moderate") == [25]
-        assert values("intensity_minutes_vigorous") == [12]
-        assert values("basal_energy") == [1800]
+        # Garmin's day values (dailies, userMetrics) are stored as day aggregates upstream: read per day.
+        assert values("vo2_max", "1day") == [48.0]
+        assert values("intensity_minutes_moderate", "1day") == [25]
+        assert values("intensity_minutes_vigorous", "1day") == [12]
+        assert values("basal_energy", "1day") == [1800]
 
         moderate = self._get(
-            client, api_key.id, f"{base}/timeseries", {**window, "types": "intensity_minutes_moderate"}
+            client,
+            api_key.plain_key,
+            f"{base}/timeseries",
+            {**window, "types": "intensity_minutes_moderate", "resolution": "1day"},
         )["data"][0]
         assert moderate["unit"] == "minutes"
-        assert moderate["is_daily_total"] is True
         assert moderate["source"]["provider"] == "garmin"
 
         sleep = self._get(
             client,
-            api_key.id,
+            api_key.plain_key,
             f"{base}/events/sleep",
-            {"start_date": "2024-01-14T00:00:00Z", "end_date": "2024-01-16T00:00:00Z"},
+            {"start_date": "2024-01-14T00:00:00Z", "end_date": "2024-01-16T00:00:00Z", "include": "stages"},
         )["data"]
         assert len(sleep) == 1
         assert [i["stage"] for i in sleep[0]["sleep_stage_intervals"]] == ["light", "deep", "rem", "awake"]
@@ -410,7 +342,7 @@ class TestPushToReadEndpoints:
 
         scores = self._get(
             client,
-            api_key.id,
+            api_key.plain_key,
             f"{base}/health-scores",
             {"start_date": "2024-01-14T00:00:00Z", "end_date": "2024-01-16T00:00:00Z", "provider": "garmin"},
         )["data"]

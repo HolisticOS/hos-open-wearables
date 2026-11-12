@@ -64,6 +64,8 @@ class TestSuuntoWorkouts:
             "totalDistance": 10000,
             "stepCount": 8500,
             "energyConsumption": 650,
+            "avgSpeed": 2.78,
+            "maxSpeed": 4.1,
             "hrdata": {
                 "workoutMaxHR": 175,
                 "workoutAvgHR": 145,
@@ -129,6 +131,8 @@ class TestSuuntoWorkouts:
         assert metrics["steps_count"] == 8500
         assert metrics["energy_burned"] == Decimal("650")
         assert metrics["distance"] == Decimal("10000")
+        assert metrics["average_speed"] == Decimal("2.78")
+        assert metrics["max_speed"] == Decimal("4.1")
 
     def test_build_metrics_with_missing_heart_rate(
         self,
@@ -168,6 +172,30 @@ class TestSuuntoWorkouts:
 
         # Assert
         assert metrics["steps_count"] is None
+
+    def test_workout_accepts_fractional_total_distance(
+        self,
+        suunto_workouts: SuuntoWorkouts,
+        sample_workout_data: dict,
+    ) -> None:
+        """Suunto reports totalDistance as a float, so fractional meters must parse.
+
+        Regression test: the field was typed ``int``, so a real distance such as
+        21381.4 m raised ``int_from_float`` during ``WorkoutJSON(**w)``. Because
+        load_data parses the whole payload in one list comprehension, a single
+        fractional-distance workout aborted the entire sync with an HTTP 500.
+        """
+        # Arrange
+        workout_data = sample_workout_data.copy()
+        workout_data["totalDistance"] = 21381.4
+
+        # Act
+        workout = SuuntoWorkoutJSON(**workout_data)
+        metrics = suunto_workouts._build_metrics(workout)
+
+        # Assert
+        assert workout.totalDistance == 21381.4
+        assert metrics["distance"] == Decimal("21381.4")
 
     def test_normalize_workout_creates_event_record(
         self,
@@ -352,6 +380,37 @@ class TestSuuntoWorkouts:
         mock_create_detail.assert_called_once()
         # Verify data source creation was attempted
         mock_ensure_data_source.assert_called_once()
+
+    @patch.object(SuuntoWorkouts, "_make_api_request")
+    @patch("app.services.event_record_service.event_record_service.create")
+    @patch("app.services.event_record_service.event_record_service.create_detail")
+    @patch("app.repositories.data_source_repository.DataSourceRepository.ensure_data_source")
+    def test_load_data_walks_every_page(
+        self,
+        mock_ensure_data_source: MagicMock,
+        mock_create_detail: MagicMock,
+        mock_create: MagicMock,
+        mock_request: MagicMock,
+        suunto_workouts: SuuntoWorkouts,
+        db: Session,
+        sample_workout_data: dict,
+    ) -> None:
+        """Historical sync must not stop at the first page of 100 workouts."""
+        from tests.factories import UserFactory
+
+        user = UserFactory()
+        mock_request.side_effect = [
+            {"payload": [sample_workout_data] * 100},
+            {"payload": [sample_workout_data] * 100},
+            {"payload": [sample_workout_data] * 30},
+        ]
+
+        result = suunto_workouts.load_data(db, user.id, start_date="2025-01-01T00:00:00Z")
+
+        assert result == 230
+        pages = [call.kwargs["params"] for call in mock_request.call_args_list]
+        assert [(page["offset"], page["limit"]) for page in pages] == [(0, 100), (100, 100), (200, 100)]
+        assert {page["since"] for page in pages} == {1735689600000}
 
     @patch("app.services.event_record_service.event_record_service.create")
     @patch("app.services.event_record_service.event_record_service.create_detail")

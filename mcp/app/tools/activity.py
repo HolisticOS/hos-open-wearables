@@ -5,6 +5,7 @@ import logging
 from fastmcp import FastMCP
 
 from app.services.api_client import client
+from app.services.exceptions import NotFoundError, OpenWearablesError
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,10 @@ async def get_activity_summary(
           "this month" -> start_date = first of month, end_date = today
         - Steps is the most universal metric tracked by all wearables.
         - active_calories_kcal is energy burned through activity (exercise).
-        - total_calories_kcal includes active calories plus basal metabolic rate.
+        - total_calories_kcal is total energy burned, including basal metabolic rate: the
+          provider's reported total when available, otherwise active + basal calories when
+          both are reported; null otherwise. Providers without an active/basal split (e.g. Whoop)
+          report only the total, so their active_calories_kcal is null.
         - intensity_minutes categorize activity by heart rate zones:
           light (zone 1-2), moderate (zone 3), vigorous (zone 4-5).
         - The 'source' field indicates which wearable provided the data (garmin, whoop, etc.)
@@ -104,7 +108,7 @@ async def get_activity_summary(
                 "first_name": user_data.get("first_name"),
                 "last_name": user_data.get("last_name"),
             }
-        except ValueError as e:
+        except NotFoundError as e:
             return {"error": f"User not found: {user_id}", "details": str(e)}
 
         # Fetch activity data
@@ -202,7 +206,7 @@ async def get_activity_summary(
             "summary": summary,
         }
 
-    except ValueError as e:
+    except OpenWearablesError as e:
         logger.error(f"API error in get_activity_summary: {e}")
         return {"error": str(e)}
     except Exception as e:
