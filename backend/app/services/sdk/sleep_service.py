@@ -37,6 +37,7 @@ from app.schemas.providers.mobile_sdk import (
 )
 from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
+from app.services.hos_notify import schedule_hos_notify
 from app.services.sdk.device_resolution import extract_device_ids, extract_device_info, extract_device_type
 from app.utils.dates import as_utc
 from app.utils.sleep_stages import measured_stages
@@ -707,6 +708,10 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         # keeps the session available for the next periodic finalization attempt.
         delete_sleep_state(user_id, state)
         event_record_service.reclassify_sleep_naps_after_write(db_session, UUID(user_id), created_or_existing_record)
+        # A night is saved here, not when its samples are uploaded: the periodic
+        # finalizer closes most sessions long after the last upload notified HOS,
+        # so without this HOS only ever sees the partial night.
+        schedule_hos_notify([user_id], state.provider or "apple")
     except Exception as e:
         logger.error(
             "Error saving sleep record",

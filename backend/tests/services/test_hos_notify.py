@@ -119,3 +119,25 @@ class TestSavedUserIds:
     )
     def test_nothing_saved_means_no_notify(self, result: Any) -> None:
         assert push_task._saved_user_ids(result) == []
+
+    def test_withings_notifies_every_linked_profile(self) -> None:
+        ids = [str(uuid4()), str(uuid4())]
+        result = {"status": "processed", "records_saved": 2, "items_processed": 2, "user_ids": ids}
+        assert push_task._saved_user_ids(result) == ids
+
+    def test_withings_with_nothing_saved(self) -> None:
+        assert push_task._saved_user_ids({"status": "processed", "records_saved": 0, "user_ids": ["u"]}) == []
+
+    def test_google_health_batch_collects_each_saved_item(self) -> None:
+        a, b = str(uuid4()), str(uuid4())
+        result = {
+            "status": "processed",
+            "records_saved": 4,
+            "results": [
+                {"status": "processed", "records_saved": 3, "user_id": a},
+                {"status": "processed", "records_saved": 0, "user_id": b},
+                {"status": "processed", "records_saved": 1, "user_id": a},
+                {"status": "error", "error": "boom"},
+            ],
+        }
+        assert push_task._saved_user_ids(result) == [a]

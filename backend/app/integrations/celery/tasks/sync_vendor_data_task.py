@@ -20,6 +20,7 @@ from app.schemas.sync_status import (
     SyncStage,
     SyncStatus,
 )
+from app.services.hos_notify import schedule_hos_notify
 from app.services.provider_settings_service import include_in_periodic_pull, live_sync_mode_of
 from app.services.providers.factory import ProviderFactory
 from app.services.providers.sync_247_result import Sync247TaskOutcome, error_code_of
@@ -297,6 +298,7 @@ def sync_vendor_data(
                     pull_inserted = 0
                     pull_updated = 0
                     pull_written = 0
+                    workouts_written = 0
                     data_type_outcomes: list[DataTypeOutcome] = []
                     applied_lookback: timedelta | None = None  # set when the lookback actually widened the window
 
@@ -343,6 +345,7 @@ def sync_vendor_data(
                         )
                         try:
                             success = strategy.workouts.load_data(db, user_uuid, **params)
+                            workouts_written = int(success or 0)
                             provider_result.params["workouts"] = {"success": success, **params}
                             # load_data returns how many workouts it wrote, not a boolean.
                             data_type_outcomes.append(
@@ -479,6 +482,10 @@ def sync_vendor_data(
                             )
 
                     result.providers_synced[provider_name] = provider_result
+                    # Pull-mode providers (and the first sync after an OAuth connect) never
+                    # pass through a webhook, so this is HOS's only cue that they wrote data.
+                    if workouts_written or pull_written:
+                        schedule_hos_notify([user_id], provider_name)
                     logger.info(
                         "Successfully synced provider",
                         provider=provider_name,

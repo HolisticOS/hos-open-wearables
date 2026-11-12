@@ -188,6 +188,15 @@ def _saved_user_ids(result: Any) -> list[str]:
         return []
     if "synced_user_ids" in result:
         return [str(u) for u in result["synced_user_ids"]]
+    # Google Health batches notifications and reports one result per item.
+    if isinstance(result.get("results"), list):
+        return sorted({uid for item in result["results"] for uid in _saved_user_ids(item)})
+    status_str = str(result.get("status") or "").lower()
+    # Withings resolves one provider account to every OW profile linked to it.
+    if isinstance(result.get("user_ids"), list):
+        if status_str in _SAVED_STATUSES and (_extract_item_count(result) or 0) > 0:
+            return [str(u) for u in result["user_ids"]]
+        return []
     status_str = str(result.get("status") or "").lower()
     if result.get("user_id") and status_str in _SAVED_STATUSES and (_extract_item_count(result) or 0) > 0:
         return [str(result["user_id"])]

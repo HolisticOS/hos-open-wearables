@@ -1384,3 +1384,54 @@ class TestSleepStateZoneOffsetTracksSessionEnd:
         # the bedtime (-05:00) sample's — that's what the wake date is
         # computed from everywhere downstream.
         assert state.zone_offset == "-08:00"
+
+
+class TestFinishSleepNotifiesHos:
+    """A finished night tells HOS, whichever path closed it (upload or periodic finalizer)."""
+
+    def _state(self) -> SleepState:
+        return SleepState(
+            uuid=str(uuid4()),
+            source_name="WHOOP",
+            device_model="iPhone18,1",
+            provider="apple",
+            start_time=_dt("2026-11-11T04:02:00Z"),
+            end_time=_dt("2026-11-11T11:50:00Z"),
+            last_start_timestamp=_dt("2026-11-11T11:00:00Z"),
+            last_end_timestamp=_dt("2026-11-11T11:50:00Z"),
+            sleeping_seconds=26400.0,
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.SLEEPING,
+                    start_time=_dt("2026-11-11T04:02:00Z"),
+                    end_time=_dt("2026-11-11T11:50:00Z"),
+                ),
+            ],
+        )
+
+    @patch("app.services.sdk.sleep_service.schedule_hos_notify")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
+    def test_saved_night_notifies(
+        self, delete_state: MagicMock, events: MagicMock, notify: MagicMock, db: Session
+    ) -> None:
+        events.create.return_value = MagicMock(id=uuid4())
+        events.find_adjacent_sleep_record.return_value = None
+        user_id = str(uuid4())
+
+        finish_sleep(db, user_id, self._state())
+
+        notify.assert_called_once_with([user_id], "apple")
+
+    @patch("app.services.sdk.sleep_service.schedule_hos_notify")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
+    def test_failed_save_does_not_notify(
+        self, delete_state: MagicMock, events: MagicMock, notify: MagicMock, db: Session
+    ) -> None:
+        events.create.side_effect = RuntimeError("db down")
+        events.find_adjacent_sleep_record.return_value = None
+
+        finish_sleep(db, str(uuid4()), self._state())
+
+        notify.assert_not_called()

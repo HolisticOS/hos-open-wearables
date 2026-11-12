@@ -488,3 +488,34 @@ class TestSyncVendorDataLinkedSkip:
 
         db.refresh(connection)
         assert connection.last_synced_at == before
+
+
+class TestSyncVendorDataNotifiesHos:
+    """A pull that wrote data is HOS's cue to look; a pull that wrote nothing is not."""
+
+    def _run(self, db: Session, provider: str, written: int) -> MagicMock:
+        user = UserFactory()
+        UserConnectionFactory(user=user, provider=provider, status=ConnectionStatus.ACTIVE)
+        strategy = MagicMock()
+        strategy.capabilities.rest_pull = True
+        strategy.capabilities.webhook_stream = False
+        strategy.workouts.load_data.return_value = written
+        strategy.data_247 = None
+        with (
+            patch("app.integrations.celery.tasks.sync_vendor_data_task.SessionLocal") as session_local,
+            patch("app.services.providers.factory.ProviderFactory.get_provider", return_value=strategy),
+            patch("app.integrations.celery.tasks.sync_vendor_data_task.schedule_hos_notify") as notify,
+        ):
+            session_local.return_value.__enter__.return_value = db
+            session_local.return_value.__exit__.return_value = None
+            sync_vendor_data(str(user.id))
+        notify.user_id = str(user.id)  # type: ignore[attr-defined]
+        return notify
+
+    def test_written_workouts_notify(self, db: Session, mock_celery_app: MagicMock) -> None:
+        notify = self._run(db, "polar", 2)
+        notify.assert_called_once_with([notify.user_id], "polar")
+
+    def test_nothing_written_does_not_notify(self, db: Session, mock_celery_app: MagicMock) -> None:
+        notify = self._run(db, "polar", 0)
+        notify.assert_not_called()
