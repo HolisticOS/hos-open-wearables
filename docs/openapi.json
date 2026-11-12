@@ -171,7 +171,7 @@
           "External: Users"
         ],
         "summary": "List Users",
-        "description": "List users with pagination, sorting, and search.",
+        "description": "List users with pagination, sorting, and search.\n\nA plain def on purpose: the query is blocking, so FastAPI must run it in the\nthreadpool. As an async def it ran on the event loop, and while the DB pool\nwas full it blocked there waiting for a connection, which stopped the loop\nfrom finishing the requests that would have returned one. The whole server\nhung, / included, until restarted.",
         "operationId": "list_users_api_v1_users_get",
         "security": [
           {
@@ -674,6 +674,7 @@
           "External: Users"
         ],
         "summary": "Delete User",
+        "description": "Delete a user and all of their data.\n\nAccepts an API key or a developer session. Active provider connections are\nderegistered with the provider first (best-effort).",
         "operationId": "delete_user_api_v1_users__user_id__delete",
         "security": [
           {
@@ -1289,7 +1290,7 @@
           "External: Summaries"
         ],
         "summary": "Get Activity Summary",
-        "description": "Returns daily aggregated activity metrics.\n\nEach day reports its highest-priority source; metrics it lacks are filled from lower-priority sources.\n\nAggregates time-series data (steps, energy, heart rate, etc.) by day.",
+        "description": "Returns daily aggregated activity metrics.\n\nEach day reports its highest-priority source; metrics it lacks are filled from lower-priority sources.\n\nAggregates time-series data (steps, energy, heart rate, etc.) by day.\n\n`timezone` decides which day a sample belongs to when the sample itself\ncarries no zone offset — only about a quarter of step samples do. Without\nit those fall back to UTC, which files a negative-offset user's evening\nunder the following day. Pass the wearer's own IANA zone whenever the\ncaller knows it; an unknown name is rejected rather than silently ignored.",
         "operationId": "get_activity_summary_api_v1_users__user_id__summaries_activity_get",
         "security": [
           {
@@ -1377,6 +1378,24 @@
               "default": "asc",
               "title": "Sort Order"
             }
+          },
+          {
+            "name": "timezone",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "IANA timezone, e.g. America/New_York",
+              "title": "Timezone"
+            },
+            "description": "IANA timezone, e.g. America/New_York"
           },
           {
             "name": "X-Open-Wearables-API-Key",
@@ -2751,6 +2770,20 @@
             "description": "`all` returns every source's sessions. `per_session` drops a session when the sessions of one source ranked higher by provider, then device type priority, cover at least `SESSION_DUPLICATE_OVERLAP` of it (default 0.5); sessions nothing better covers stay, and equally ranked sources never hide each other. Source filters narrow which sessions compete. Defaults to `all`."
           },
           {
+            "name": "filter_by_priority",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Same as source_selection=per_session.",
+              "deprecated": true,
+              "default": false,
+              "title": "Filter By Priority"
+            },
+            "description": "Same as source_selection=per_session.",
+            "deprecated": true
+          },
+          {
             "name": "X-Open-Wearables-API-Key",
             "in": "header",
             "required": false,
@@ -3101,6 +3134,130 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/WorkoutTotals"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationProblem"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "description": "Client error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "description": "Server error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/users/{user_id}/events/workouts/{workout_id}/samples": {
+      "get": {
+        "tags": [
+          "External: Events"
+        ],
+        "summary": "Get Workout Samples",
+        "description": "Returns one workout's samples downsampled by time, its route, laps and time in zones.",
+        "operationId": "get_workout_samples_api_v1_users__user_id__events_workouts__workout_id__samples_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "user_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "User Id"
+            }
+          },
+          {
+            "name": "workout_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Workout Id"
+            }
+          },
+          {
+            "name": "types",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "$ref": "#/components/schemas/SeriesType"
+              },
+              "description": "Series to return (repeatable). Default: all of heart_rate, speed, cadence, power, elevation, air_temperature, latitude, longitude. latitude and longitude together form the route.",
+              "default": [],
+              "title": "Types"
+            },
+            "description": "Series to return (repeatable). Default: all of heart_rate, speed, cadence, power, elevation, air_temperature, latitude, longitude. latitude and longitude together form the route."
+          },
+          {
+            "name": "max_points",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 2000,
+              "minimum": 1,
+              "description": "Maximum points per series and for the route",
+              "default": 600,
+              "title": "Max Points"
+            },
+            "description": "Maximum points per series and for the route"
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkoutSamples"
                 }
               }
             }
@@ -4612,8 +4769,13 @@
           "External: Providers"
         ],
         "summary": "Get Provider Authorization URL",
-        "description": "Initiate OAuth flow for a provider.\n\nReturns authorization URL where user should be redirected to log in.",
+        "description": "Initiate OAuth flow for a provider.\n\nRequires an API key or a developer session. The user must exist (404 otherwise)\nand redirect_uri, if given, must be on the allow-list (400 otherwise).\n\nReturns authorization URL where user should be redirected to log in.",
         "operationId": "authorize_provider_api_v1_oauth__provider__authorize_get",
+        "security": [
+          {
+            "OAuth2PasswordBearer": []
+          }
+        ],
         "parameters": [
           {
             "name": "provider",
@@ -4649,10 +4811,26 @@
                   "type": "null"
                 }
               ],
-              "description": "Optional redirect URI after authorization",
+              "description": "Optional URI to send the user to after authorization. Must be under API_BASE_URL, FRONTEND_URL or one of OAUTH_ALLOWED_REDIRECT_PREFIXES.",
               "title": "Redirect Uri"
             },
-            "description": "Optional redirect URI after authorization"
+            "description": "Optional URI to send the user to after authorization. Must be under API_BASE_URL, FRONTEND_URL or one of OAUTH_ALLOWED_REDIRECT_PREFIXES."
+          },
+          {
+            "name": "X-Open-Wearables-API-Key",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Open-Wearables-Api-Key"
+            }
           }
         ],
         "responses": {
@@ -4764,7 +4942,7 @@
           "System: OAuth"
         ],
         "summary": "Oauth Callback",
-        "description": "OAuth callback endpoint.\n\nProvider redirects here after user authorizes. Exchanges code for tokens.",
+        "description": "OAuth callback endpoint.\n\nProvider redirects here after user authorizes. Exchanges code for tokens.\n\nWhen the flow was started with a redirect_uri, the user is sent back to it\non success (with ``status=success&provider=<provider>``) and on failure\n(with ``status=error&error=<reason>``). Without one, the internal\nsuccess/error pages are used.",
         "operationId": "oauth_callback_api_v1_oauth__provider__callback_get",
         "parameters": [
           {
@@ -16761,6 +16939,46 @@
         "title": "HeartRateStats",
         "description": "Heart rate statistics for a period."
       },
+      "HeartRateZoneRead": {
+        "properties": {
+          "zone": {
+            "type": "integer",
+            "title": "Zone"
+          },
+          "min_bpm": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Bpm"
+          },
+          "max_bpm": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Bpm"
+          },
+          "seconds": {
+            "type": "number",
+            "title": "Seconds"
+          }
+        },
+        "type": "object",
+        "required": [
+          "zone",
+          "seconds"
+        ],
+        "title": "HeartRateZoneRead"
+      },
       "HistoricalDataSyncStartEvent": {
         "properties": {
           "eventType": {
@@ -18471,6 +18689,46 @@
         ],
         "title": "PowerZone"
       },
+      "PowerZoneRead": {
+        "properties": {
+          "zone": {
+            "type": "integer",
+            "title": "Zone"
+          },
+          "min_watts": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Min Watts"
+          },
+          "max_watts": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Watts"
+          },
+          "seconds": {
+            "type": "number",
+            "title": "Seconds"
+          }
+        },
+        "type": "object",
+        "required": [
+          "zone",
+          "seconds"
+        ],
+        "title": "PowerZoneRead"
+      },
       "PowerZones": {
         "properties": {
           "zones": {
@@ -19653,6 +19911,8 @@
           "physical_effort",
           "flights_climbed",
           "active_time",
+          "intensity_minutes_moderate",
+          "intensity_minutes_vigorous",
           "total_energy",
           "distance_walking_running",
           "distance_cycling",
@@ -19695,6 +19955,8 @@
           "latitude",
           "longitude",
           "air_temperature",
+          "latitude_e4",
+          "longitude_e4",
           "garmin_stress_level",
           "garmin_skin_temperature",
           "garmin_fitness_age",
@@ -23578,6 +23840,314 @@
         ],
         "title": "WorkoutIntensity",
         "description": "Unified subjective intensity of a workout, independent of the reporting provider."
+      },
+      "WorkoutLap": {
+        "properties": {
+          "index": {
+            "type": "integer",
+            "title": "Index"
+          },
+          "start_time": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Time"
+          },
+          "end_time": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Time"
+          },
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Seconds"
+          },
+          "distance_meters": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Distance Meters"
+          },
+          "avg_heart_rate_bpm": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Heart Rate Bpm"
+          },
+          "max_heart_rate_bpm": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Heart Rate Bpm"
+          },
+          "avg_speed_mps": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avg Speed Mps"
+          },
+          "max_speed_mps": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Speed Mps"
+          }
+        },
+        "additionalProperties": true,
+        "type": "object",
+        "required": [
+          "index"
+        ],
+        "title": "WorkoutLap",
+        "description": "One lap from the workout's FIT file. Extra lap metrics from the file are passed through as-is."
+      },
+      "WorkoutSampleSeries": {
+        "properties": {
+          "unit": {
+            "type": "string",
+            "title": "Unit"
+          },
+          "points": {
+            "items": {
+              "prefixItems": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "number"
+                }
+              ],
+              "type": "array",
+              "maxItems": 2,
+              "minItems": 2
+            },
+            "type": "array",
+            "title": "Points",
+            "description": "[timestamp, value] pairs, one per time bucket (bucket average)"
+          }
+        },
+        "type": "object",
+        "required": [
+          "unit"
+        ],
+        "title": "WorkoutSampleSeries"
+      },
+      "WorkoutSamples": {
+        "properties": {
+          "workout_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Workout Id"
+          },
+          "start_time": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Start Time"
+          },
+          "end_time": {
+            "type": "string",
+            "format": "date-time",
+            "title": "End Time"
+          },
+          "source": {
+            "$ref": "#/components/schemas/SourceMetadata"
+          },
+          "series": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/WorkoutSampleSeries"
+            },
+            "type": "object",
+            "title": "Series"
+          },
+          "route": {
+            "items": {
+              "prefixItems": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "number"
+                },
+                {
+                  "type": "number"
+                }
+              ],
+              "type": "array",
+              "maxItems": 3,
+              "minItems": 3
+            },
+            "type": "array",
+            "title": "Route",
+            "description": "[timestamp, latitude, longitude]; real recorded points, never averaged"
+          },
+          "laps": {
+            "items": {
+              "$ref": "#/components/schemas/WorkoutLap"
+            },
+            "type": "array",
+            "title": "Laps"
+          },
+          "sets": {
+            "items": {
+              "$ref": "#/components/schemas/WorkoutSet"
+            },
+            "type": "array",
+            "title": "Sets",
+            "description": "Strength work sets from the FIT file; empty for other activities"
+          },
+          "zones": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "items": {
+                    "$ref": "#/components/schemas/HeartRateZoneRead"
+                  },
+                  "type": "array"
+                },
+                {
+                  "items": {
+                    "$ref": "#/components/schemas/PowerZoneRead"
+                  },
+                  "type": "array"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Zones",
+            "description": "Time in zone from the FIT file; keys present only when stored"
+          }
+        },
+        "type": "object",
+        "required": [
+          "workout_id",
+          "start_time",
+          "end_time",
+          "source"
+        ],
+        "title": "WorkoutSamples",
+        "description": "Downsampled per-workout samples, route, laps and zones."
+      },
+      "WorkoutSet": {
+        "properties": {
+          "index": {
+            "type": "integer",
+            "title": "Index"
+          },
+          "start_time": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Start Time"
+          },
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Duration Seconds"
+          },
+          "exercise_category": {
+            "type": "string",
+            "title": "Exercise Category",
+            "default": "unknown"
+          },
+          "exercise_subtype": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Exercise Subtype"
+          },
+          "repetitions": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Repetitions"
+          },
+          "weight_kg": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Weight Kg"
+          }
+        },
+        "type": "object",
+        "required": [
+          "index"
+        ],
+        "title": "WorkoutSet",
+        "description": "One work set from a strength activity's FIT file (rest periods are left out).\n\n`exercise_category` is the FIT exercise_category name (squat, bench_press, row,\n...) or \"unknown\" when the watch could not tell; `exercise_subtype` is the\ncategory-specific sub-type as the file stores it."
       },
       "WorkoutTotals": {
         "properties": {
