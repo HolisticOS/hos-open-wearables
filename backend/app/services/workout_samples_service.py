@@ -99,6 +99,19 @@ class WorkoutSamplesService:
                 provider=data_source.provider,
                 source=data_source.source,
             )
+            # Still nothing: the app that wrote the workout records none (Strava, a WHOOP or
+            # SharQ workout in Apple Health), the watch worn did. Take that one source's samples.
+            if not self.data_point_repo.has_samples_in_window(db_session, window, all_ids):
+                worn = self.data_point_repo.busiest_source_in_window(db_session, window, all_ids)
+                if worn is not None:
+                    window = WorkoutSampleWindow(
+                        user_id=user_id,
+                        start=record.start_datetime,
+                        end=record.end_datetime,
+                        provider=data_source.provider,
+                        source=None,
+                        data_source_id=worn,
+                    )
 
         series: dict[str, WorkoutSampleSeries] = {}
         if numeric_ids:
