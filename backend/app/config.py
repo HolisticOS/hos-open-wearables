@@ -82,6 +82,19 @@ class Settings(BaseSettings):
     db_name: str = "open-wearables"
     db_user: str = "open-wearables"
     db_password: SecretStr = SecretStr("open-wearables")
+    # A pooled connection that the network dropped without telling either end
+    # (an idle timeout on the path between the app and Postgres) is found out
+    # only when it is next used. Without these, that use, the pool's own
+    # pre-ping included, waits out the kernel's TCP retransmit timeout (~15.5
+    # min) and holds a request thread the whole time; enough of them froze
+    # every API route and worker task for 15 minutes at a stretch.
+    db_pool_recycle_seconds: int = 300
+    db_connect_timeout_seconds: int = 10
+    db_tcp_keepalive_idle_seconds: int = 30
+    db_tcp_keepalive_interval_seconds: int = 10
+    db_tcp_keepalive_count: int = 3
+    # Unacknowledged sends fail after this long instead of the ~15.5 min default.
+    db_tcp_user_timeout_ms: int = 30_000
 
     # Sentry
     SENTRY_ENABLED: bool = False
