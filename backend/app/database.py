@@ -29,13 +29,35 @@ from app.schemas.model_crud.user_management import InvitationStatus
 from app.schemas.sync_status import SyncScope, SyncSource, SyncStatus
 from app.utils.mappings_meta import AutoRelMeta
 
+
+def db_connect_args() -> dict[str, int]:
+    """libpq options that make a silently dropped connection fail in seconds.
+
+    Keepalives probe an idle connection so the path never ages it out, and
+    tcp_user_timeout bounds how long a send may go unacknowledged; together a
+    dead peer is detected in well under a minute rather than after the kernel's
+    ~15.5 minute retransmit timeout. See Settings.db_pool_recycle_seconds.
+    """
+    return {
+        "connect_timeout": settings.db_connect_timeout_seconds,
+        "keepalives": 1,
+        "keepalives_idle": settings.db_tcp_keepalive_idle_seconds,
+        "keepalives_interval": settings.db_tcp_keepalive_interval_seconds,
+        "keepalives_count": settings.db_tcp_keepalive_count,
+        "tcp_user_timeout": settings.db_tcp_user_timeout_ms,
+    }
+
+
 engine = create_engine(
     settings.db_uri,
     pool_pre_ping=True,
     pool_size=20,
     max_overflow=30,
     pool_timeout=30,
-    pool_recycle=3600,
+    # Below the idle timeout of the network path, so a connection is retired
+    # before anything between here and Postgres can drop it.
+    pool_recycle=settings.db_pool_recycle_seconds,
+    connect_args=db_connect_args(),
 )
 
 
