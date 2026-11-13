@@ -1411,6 +1411,24 @@ class DataPointSeriesRepository(
         """True when at least one sample of the given types exists for the window's scope."""
         return self._workout_window_query(db_session, [self.model.id], window, type_ids).limit(1).first() is not None
 
+    def busiest_source_in_window(
+        self, db_session: DbSession, window: WorkoutSampleWindow, type_ids: list[int]
+    ) -> UUID | None:
+        """The user's data source of the window's provider, any source name, with the most samples
+        of the given types in the window: the device that was worn. One source, never a blend, so
+        two watches recording at once don't average into a line neither of them drew."""
+        scope = WorkoutSampleWindow(
+            user_id=window.user_id, start=window.start, end=window.end, provider=window.provider, source=None
+        )
+        row = (
+            self._workout_window_query(db_session, [self.model.data_source_id], scope, type_ids)
+            .group_by(self.model.data_source_id)
+            .order_by(func.count().desc(), self.model.data_source_id)
+            .limit(1)
+            .first()
+        )
+        return row[0] if row else None
+
     def get_bucketed_averages(
         self,
         db_session: DbSession,

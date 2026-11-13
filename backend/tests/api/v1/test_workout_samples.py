@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 from app.models import DataSource, EventRecord, SeriesSample
 from app.repositories.data_point_series_repository import DataPointSeriesRepository
 from app.repositories.user_connection_repository import UserConnectionRepository
-from app.schemas.enums import ProviderName, SeriesType
+from app.schemas.enums import ProviderName, SeriesType, get_series_type_id
 from app.schemas.model_crud.activities import TimeSeriesSampleCreate
 from app.services.providers.garmin.data_247 import Garmin247Data
 from app.services.providers.garmin.oauth import GarminOAuth
@@ -142,6 +142,23 @@ def _apple_heart_rate(db: Session, user: Any, value: int) -> DataSource:
     return db.query(DataSource).filter(DataSource.user_id == user.id, DataSource.provider == ProviderName.APPLE).one()
 
 
+def _apple_writer_heart_rate(db: Session, user: Any, writer: str, value: int, every: int) -> DataSource:
+    """Heart rate one Apple Health writer (a watch, a strap) recorded during the hour, every ``every`` s."""
+    source = DataSourceFactory(user=user, provider=ProviderName.APPLE, source=writer)
+    db.add_all(
+        SeriesSample(
+            id=uuid4(),
+            data_source_id=source.id,
+            recorded_at=START + timedelta(seconds=i),
+            value=Decimal(value),
+            series_type_definition_id=get_series_type_id(SeriesType.heart_rate),
+        )
+        for i in range(0, DURATION, every)
+    )
+    db.flush()
+    return source
+
+
 class TestWorkoutSamplesEndpoint:
     def _get(self, client: TestClient, user_id: Any, workout_id: Any, **params: Any) -> Any:
         return client.get(
@@ -232,6 +249,48 @@ class TestWorkoutSamplesEndpoint:
         assert body["route"] == []
         assert body["laps"] == []
         assert body["zones"] == {}
+
+    def test_writer_without_samples_takes_the_worn_device(
+        self, client: TestClient, db: Session, garmin_247: Garmin247Data
+    ) -> None:
+        """A Strava workout in Apple Health has no samples of its own; the watch worn recorded them.
+        The source with the most samples wins, alone, and Garmin's never mix in."""
+        user = UserFactory()
+        _garmin_workout(db, garmin_247, user)
+        watch = _apple_writer_heart_rate(db, user, "Prakash's Apple Watch", value=131, every=5)
+        _apple_writer_heart_rate(db, user, "WHOOP", value=88, every=60)
+        strava = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="Strava")
+        workout = EventRecordFactory(
+            data_source=strava,
+            category="workout",
+            type="running",
+            duration_seconds=DURATION,
+            start_datetime=START,
+            end_datetime=START + timedelta(seconds=DURATION),
+        )
+
+        body = self._get(client, user.id, workout.id).json()
+
+        assert set(body["series"]) == {"heart_rate"}
+        assert {value for _, value in body["series"]["heart_rate"]["points"]} == {131.0}
+        assert watch.source == "Prakash's Apple Watch"
+
+    def test_no_samples_anywhere_stays_empty(self, client: TestClient, db: Session) -> None:
+        user = UserFactory()
+        strava = DataSourceFactory(user=user, provider=ProviderName.APPLE, source="Strava")
+        workout = EventRecordFactory(
+            data_source=strava,
+            category="workout",
+            type="running",
+            duration_seconds=DURATION,
+            start_datetime=START,
+            end_datetime=START + timedelta(seconds=DURATION),
+        )
+
+        body = self._get(client, user.id, workout.id).json()
+
+        assert body["series"] == {}
+        assert body["route"] == []
 
     def test_not_users_workout_is_404(self, client: TestClient, db: Session, garmin_247: Garmin247Data) -> None:
         owner = UserFactory()
