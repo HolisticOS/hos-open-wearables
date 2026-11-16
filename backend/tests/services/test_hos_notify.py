@@ -4,6 +4,7 @@ inside the window folds into one follow-up, and nothing runs when unset."""
 from __future__ import annotations
 
 from collections.abc import Generator
+from datetime import date
 from typing import Any
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -94,6 +95,79 @@ class TestNotifyTask:
             post.return_value = httpx.Response(200, request=httpx.Request("POST", settings.hos_notify_url or ""))
             result = notify_task.notify_hos.run(uid, "garmin", True)
         assert result["status"] == "sent"
+
+
+def _ok() -> httpx.Response:
+    return httpx.Response(200, request=httpx.Request("POST", settings.hos_notify_url or ""))
+
+
+class TestNotifyDates:
+    """The optional `dates` field: the member-local days a batch touched, deduped, sorted, the 7 most recent."""
+
+    def test_normalize_dedupes_sorts_and_keeps_the_most_recent_seven(self) -> None:
+        days = [date(2026, 11, d) for d in (9, 1, 3, 3, 2, 8, 4, 5, 6, 7)]
+        assert hos_notify.normalize_dates(days) == [f"2026-11-{d:02d}" for d in range(3, 10)]
+
+    def test_normalize_without_dates_is_none(self) -> None:
+        assert hos_notify.normalize_dates(None) is None
+        assert hos_notify.normalize_dates([]) is None
+
+    def test_first_call_sends_its_dates_now(self, enabled: None, celery: MagicMock) -> None:
+        uid = str(uuid4())
+        hos_notify.schedule_hos_notify([uid], "health_connect", dates=["2026-11-15", date(2026, 11, 14)])
+        assert _sent(celery) == [
+            ([uid, "health_connect", False, ["2026-11-14", "2026-11-15"]], None),
+            ([uid, "health_connect", True], 10),
+        ]
+
+    def test_body_carries_dates_when_given(self, enabled: None) -> None:
+        uid = str(uuid4())
+        with patch.object(notify_task.httpx, "post", return_value=_ok()) as post:
+            notify_task.notify_hos.run(uid, "health_connect", False, ["2026-11-15", "2026-11-14", "2026-11-15"])
+        assert post.call_args.kwargs["json"] == {
+            "ow_user_ids": [uid],
+            "provider": "health_connect",
+            "dates": ["2026-11-14", "2026-11-15"],
+        }
+
+    def test_follow_up_carries_the_dates_of_the_window(self, enabled: None, celery: MagicMock) -> None:
+        uid = str(uuid4())
+        hos_notify.schedule_hos_notify([uid], "health_connect", dates=["2026-11-15"])
+        hos_notify.schedule_hos_notify([uid], "health_connect", dates=["2026-11-14"])
+        hos_notify.schedule_hos_notify([uid], "health_connect", dates=["2026-11-16", "2026-11-14"])
+        with patch.object(notify_task.httpx, "post", return_value=_ok()) as post:
+            result = notify_task.notify_hos.run(uid, "health_connect", True)
+        assert result["status"] == "sent"
+        assert post.call_args.kwargs["json"]["dates"] == ["2026-11-14", "2026-11-16"]
+
+    def test_follow_up_leaves_dates_out_when_a_call_had_none(self, enabled: None, celery: MagicMock) -> None:
+        uid = str(uuid4())
+        hos_notify.schedule_hos_notify([uid], "health_connect", dates=["2026-11-15"])
+        hos_notify.schedule_hos_notify([uid], "health_connect", dates=["2026-11-14"])
+        hos_notify.schedule_hos_notify([uid], "garmin")  # no dates: HOS must refresh everything
+        with patch.object(notify_task.httpx, "post", return_value=_ok()) as post:
+            notify_task.notify_hos.run(uid, "health_connect", True)
+        assert "dates" not in post.call_args.kwargs["json"]
+
+    def test_pending_dates_are_taken_once(self, enabled: None, celery: MagicMock) -> None:
+        uid = str(uuid4())
+        hos_notify.schedule_hos_notify([uid], "health_connect", dates=["2026-11-15"])
+        hos_notify.schedule_hos_notify([uid], "health_connect", dates=["2026-11-14"])
+        assert hos_notify.take_pending_dates(uid) == ["2026-11-14"]
+        assert hos_notify.take_pending_dates(uid) is None
+
+    def test_a_failed_follow_up_retries_with_the_dates_it_took(self, enabled: None, celery: MagicMock) -> None:
+        uid = str(uuid4())
+        hos_notify.schedule_hos_notify([uid], "health_connect", dates=["2026-11-15"])
+        hos_notify.schedule_hos_notify([uid], "health_connect", dates=["2026-11-14"])
+        failing = httpx.Response(503, request=httpx.Request("POST", settings.hos_notify_url or ""))
+        with (
+            patch.object(notify_task.httpx, "post", return_value=failing),
+            patch.object(notify_task.notify_hos, "retry", side_effect=RuntimeError("retry")) as retry,
+            pytest.raises(RuntimeError),
+        ):
+            notify_task.notify_hos.run(uid, "health_connect", True)
+        assert retry.call_args.kwargs["args"] == [uid, "health_connect", True, ["2026-11-14"]]
 
 
 class TestSavedUserIds:

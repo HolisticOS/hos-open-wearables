@@ -13,6 +13,7 @@ from app.models import (
     DetailType,
     EventRecordAggregate,
     EventRecordDetail,
+    SleepDetails,
     WorkoutDetails,
 )
 from app.repositories.aggregate_repository import AggregateRepository
@@ -204,6 +205,18 @@ class EventRecordDetailRepository(
         if detail is not None:
             db_session.delete(detail)
             db_session.flush()
+
+    def update_sleep_fields(
+        self,
+        db_session: DbSession,
+        record_id: UUID,
+        fields: dict[str, Any],
+    ) -> None:
+        """Patch columns on the sleep_details row for the given record.
+
+        NOTE: Caller is responsible for committing or flushing the transaction.
+        """
+        db_session.execute(update(SleepDetails).where(SleepDetails.record_id == record_id).values(**fields))
 
     def update_workout_fields(
         self,

@@ -1,5 +1,6 @@
 import contextlib
 import json
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, cast
@@ -39,7 +40,7 @@ from app.services.event_record_service import event_record_service
 from app.services.health_score_service import health_score_service
 from app.services.hos_notify import schedule_hos_notify
 from app.services.sdk.device_resolution import extract_device_ids, extract_device_info, extract_device_type
-from app.utils.dates import as_utc
+from app.utils.dates import as_utc, local_date, parse_zone_offset
 from app.utils.sleep_stages import measured_stages
 from app.utils.structured_logging import get_logger
 
@@ -58,6 +59,10 @@ _STAGE_TO_METRIC: dict[str, str] = {
 
 
 SLEEP_SCORE_VALUE_TYPE = "sleepScore"
+
+# Providers whose writers store a night as one finished session (Health Connect SleepSessionRecord, Samsung
+# Health sleep), so a session is complete once its writer's upload has gone quiet, like an Apple Watch night.
+WHOLE_SESSION_PROVIDERS = frozenset({ProviderName.HEALTH_CONNECT.value, ProviderName.SAMSUNG.value})
 
 
 def _extract_sleep_score(values: list[dict[str, Any]] | None) -> float | None:
@@ -142,11 +147,16 @@ def delete_sleep_state(user_id: str, state: SleepState) -> None:
 
 
 def is_ready_to_finish(state: SleepState, now: datetime) -> bool:
-    """True after the end gap, or for a session with Apple Watch sleep once its writer's uploads go quiet."""
+    """True after the end gap, or once the writer's uploads go quiet for a session known to arrive whole.
+
+    That is one with Apple Watch sleep, or any Health Connect / Samsung session: their writers save the night
+    when it ends, so waiting out the end gap only held a finished night back from HOS for two more hours. A night
+    a writer does save in parts is still put back together, as finish_sleep merges it with the adjacent record.
+    """
     if now - as_utc(state.end_time) >= timedelta(minutes=settings.sleep_end_gap_minutes):
         return True
     return (
-        state.has_apple_watch_sleep
+        (state.has_apple_watch_sleep or state.provider in WHOLE_SESSION_PROVIDERS)
         and state.last_received_at is not None
         and now - as_utc(state.last_received_at) >= timedelta(minutes=settings.sleep_upload_quiet_minutes)
     )
@@ -365,9 +375,9 @@ def handle_sleep_data(
                 seen.add(key_tuple)
                 unique_data.append(item)
 
-        # Fix OW-05: zoneOffset is optional on the wire, and every downstream
-        # wake-date derivation defaults a missing one to UTC — see the
-        # identical note in import_service.py's workout/record bundlers.
+        # Fix OW-05: zoneOffset is optional on the wire. A session saved without
+        # one takes the member's latest known offset in finish_sleep, and UTC
+        # only when OW has none — see the note in import_service.py's bundlers.
         missing_offset = sum(1 for item in unique_data if not item.zoneOffset)
         if missing_offset:
             logger.warning(
@@ -380,6 +390,7 @@ def handle_sleep_data(
             )
 
         received_fields: set[str] = set()
+        unrecognized_stages: Counter[str] = Counter()
         for sjson in unique_data:
             # Extract device info
             device_model, software_version, original_source_name = extract_device_info(sjson.source, provider)
@@ -389,6 +400,7 @@ def handle_sleep_data(
             sleep_phase = get_apple_sleep_phase(sjson.stage)
 
             if sleep_phase is None:
+                unrecognized_stages[str(sjson.stage)[:40]] += 1
                 continue
 
             field = session_field(provider, source_app_id)
@@ -435,6 +447,18 @@ def handle_sleep_data(
             sleep_score = _extract_sleep_score(sjson.values)
             if sleep_score is not None:
                 current_state.sleep_score = sleep_score
+
+        if unrecognized_stages:
+            # Skipped, not stored: say which stage names, so a new SDK or writer spelling gets a mapping.
+            logger.warning(
+                "Sleep samples with an unrecognized stage skipped",
+                action="sleep_unrecognized_stage",
+                provider=provider,
+                user_id=user_id,
+                count=sum(unrecognized_stages.values()),
+                total=len(unique_data),
+                stages=dict(unrecognized_stages.most_common(10)),
+            )
 
         # Persist the accumulated state to Redis only once after processing the entire batch
         now = datetime.now(timezone.utc)
@@ -583,6 +607,29 @@ def _calculate_final_metrics(stages: list[SleepStateStage]) -> tuple[dict, list[
     return metrics, cleaned_stages
 
 
+def _session_zone_offset(
+    db_session: DbSession, user_id: str, state: SleepState, adjacent: EventRecord | None
+) -> str | None:
+    """The offset a night is saved with: its own, else the merged record's, else the member's latest known one.
+
+    OW keeps no timezone per user, so the latest offset on the member's other records stands in for one. Without
+    any, the night stays at UTC (its wake date can be a day off) and the gap is logged so it can be counted.
+    """
+    if offset := parse_zone_offset(state.zone_offset):
+        return offset
+    offset = parse_zone_offset(adjacent.zone_offset if adjacent is not None else None) or parse_zone_offset(
+        event_record_service.get_latest_zone_offset(db_session, UUID(user_id))
+    )
+    logger.warning(
+        "Sleep session saved without its own zoneOffset",
+        action="sleep_zone_offset_fallback",
+        provider=state.provider or "unknown",
+        user_id=user_id,
+        fallback="member_latest" if offset else "utc",
+    )
+    return offset
+
+
 def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None:
     """Finish a sleep session and save the record to the database.
 
@@ -647,6 +694,8 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
 
     # ---
 
+    zone_offset = _session_zone_offset(db_session, user_id, state, adjacent)
+
     total_duration = (end_time - start_time).total_seconds()
     total_sleep_seconds = (
         metrics["sleeping_seconds"] + metrics["light_seconds"] + metrics["deep_seconds"] + metrics["rem_seconds"]
@@ -663,7 +712,7 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         user_id=UUID(user_id),
         start_datetime=start_time,
         end_datetime=end_time,
-        zone_offset=state.zone_offset,
+        zone_offset=zone_offset,
         duration_seconds=int(total_duration),
         category=EventCategory.SLEEP,
         type="sleep_session",
@@ -694,10 +743,17 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         created_or_existing_record = event_record_service.create(db_session, sleep_record)
         # Always use the returned record's ID (whether newly created or existing)
         detail_for_record = detail.model_copy(update={"record_id": created_or_existing_record.id})
-        event_record_service.create_detail(db_session, detail_for_record, detail_type=EventCategory.SLEEP)
-        _save_provider_sleep_score(db_session, user_id, state, created_or_existing_record, start_time)
+        # A night re-sent over the window it was saved with (the app re-reads the last 48 h) merges into
+        # exactly that window, so create() hands back the adjacent record itself. Its detail is refreshed
+        # in place and it is kept: deleting it as "superseded" deleted the only copy of the night.
+        resent_same_window = adjacent is not None and created_or_existing_record.id == adjacent.id
+        if resent_same_window:
+            event_record_service.refresh_sleep_detail(db_session, detail_for_record)
+        else:
+            event_record_service.create_detail(db_session, detail_for_record, detail_type=EventCategory.SLEEP)
+        _save_provider_sleep_score(db_session, user_id, state, created_or_existing_record, start_time, zone_offset)
 
-        if adjacent is not None:
+        if adjacent is not None and not resent_same_window:
             # Only remove the superseded record now that the merged replacement
             # is safely persisted (fix OW-03 — previously this ran before the
             # create above, so a write failure here lost the adjacent record
@@ -711,7 +767,8 @@ def finish_sleep(db_session: DbSession, user_id: str, state: SleepState) -> None
         # A night is saved here, not when its samples are uploaded: the periodic
         # finalizer closes most sessions long after the last upload notified HOS,
         # so without this HOS only ever sees the partial night.
-        schedule_hos_notify([user_id], state.provider or "apple")
+        # With the night's member-local wake date, the day HOS files it under, however late it arrived.
+        schedule_hos_notify([user_id], state.provider or "apple", dates=[local_date(as_utc(end_time), zone_offset)])
     except Exception as e:
         logger.error(
             "Error saving sleep record",
@@ -729,6 +786,7 @@ def _save_provider_sleep_score(
     state: SleepState,
     record: EventRecord,
     start_time: datetime,
+    zone_offset: str | None = None,
 ) -> None:
     """Persist the provider-computed sleep score (e.g. Samsung SLEEP_SCORE) linked to the session."""
     if state.sleep_score is None or state.provider is None:
@@ -749,7 +807,7 @@ def _save_provider_sleep_score(
                 category=HealthScoreCategory.SLEEP,
                 value=state.sleep_score,
                 recorded_at=start_time,
-                zone_offset=state.zone_offset,
+                zone_offset=zone_offset or state.zone_offset,
                 event_record_id=record.id,
             )
         ],

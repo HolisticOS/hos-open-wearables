@@ -970,9 +970,13 @@ class EventRecordRepository(
 
         # Local calendar date the session ended (wake-up date) — mirrors score
         # date logic in fill_missing_sleep_scores_task so chart, score, and
-        # session list all key on the same date.
+        # session list all key on the same date. A night saved without an offset
+        # takes the member's latest known one (OW keeps no timezone per user),
+        # and UTC only when there is none: a UTC wake date moves a night ending
+        # before the member's UTC offset (e.g. 6:30 in UTC+8) to the day before.
+        fallback_offset = self.get_latest_zone_offset(db_session, user_id) or "+00:00"
         local_sleep_date = cast(
-            EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, "+00:00"), Interval),
+            EventRecord.end_datetime + cast(func.coalesce(EventRecord.zone_offset, fallback_offset), Interval),
             Date,
         )
 
@@ -1494,6 +1498,20 @@ class EventRecordRepository(
                 }
             )
         return aggregates
+
+    def get_latest_zone_offset(self, db_session: DbSession, user_id: UUID) -> str | None:
+        """The offset of the user's most recent event that has one: the member's offset as OW last saw it.
+
+        OW stores no timezone per user, so this is what stands in for one when an event arrives without an offset.
+        """
+        return (
+            db_session.query(self.model.zone_offset)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user_id, self.model.zone_offset.isnot(None))
+            .order_by(self.model.end_datetime.desc())
+            .limit(1)
+            .scalar()
+        )
 
     def find_adjacent_sleep_record(
         self,

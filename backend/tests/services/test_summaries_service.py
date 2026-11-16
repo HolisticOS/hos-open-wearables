@@ -221,6 +221,58 @@ class TestGetSleepSummaries:
 
         assert [night.avg_spo2_percent for night in result.data] == [96.5]
 
+    def test_a_night_without_an_offset_takes_the_members_latest_one(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        """Woke at 06:30 in UTC+8 (22:30 UTC the day before): filed under the local wake day, not the UTC one."""
+        user = UserFactory()
+        ds = DataSourceFactory(user=user, provider=ProviderName.HEALTH_CONNECT, source="health_connect")
+        night = EventRecordFactory(
+            data_source=ds,
+            category="sleep",
+            type="sleep",
+            start_datetime=_dt("2026-01-01T15:00:00+00:00"),
+            end_datetime=_dt("2026-01-01T22:30:00+00:00"),
+            duration_seconds=7 * 3600 + 1800,
+            zone_offset=None,
+        )
+        SleepDetailsFactory(event_record=night)
+        EventRecordFactory(
+            data_source=ds,
+            category="workout",
+            type="running",
+            start_datetime=_dt("2026-01-02T01:00:00+00:00"),
+            end_datetime=_dt("2026-01-02T02:00:00+00:00"),
+            duration_seconds=3600,
+            zone_offset="+08:00",
+        )
+
+        result = service.get_sleep_summaries(
+            db, user.id, _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-04T00:00:00+00:00"), cursor=None, limit=10
+        )
+
+        assert [summary.date for summary in result.data] == [date(2026, 1, 2)]
+
+    def test_a_night_without_any_offset_stays_on_the_utc_day(self, db: Session, service: SummariesService) -> None:
+        user = UserFactory()
+        ds = DataSourceFactory(user=user, provider=ProviderName.HEALTH_CONNECT, source="health_connect")
+        night = EventRecordFactory(
+            data_source=ds,
+            category="sleep",
+            type="sleep",
+            start_datetime=_dt("2026-01-01T15:00:00+00:00"),
+            end_datetime=_dt("2026-01-01T22:30:00+00:00"),
+            duration_seconds=7 * 3600 + 1800,
+            zone_offset=None,
+        )
+        SleepDetailsFactory(event_record=night)
+
+        result = service.get_sleep_summaries(
+            db, user.id, _dt("2026-01-01T00:00:00+00:00"), _dt("2026-01-04T00:00:00+00:00"), cursor=None, limit=10
+        )
+
+        assert [summary.date for summary in result.data] == [date(2026, 1, 1)]
+
     def test_does_not_return_other_users_data(self, db: Session, service: SummariesService) -> None:
         user_a = UserFactory()
         user_b = UserFactory()
