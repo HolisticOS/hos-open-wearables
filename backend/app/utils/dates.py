@@ -185,6 +185,17 @@ def iso_to_timezone(offset: str) -> timezone:
     return timezone(sign * timedelta(hours=int(hours), minutes=int(minutes)))
 
 
+_ZONE_OFFSET_RE = re.compile(r"[+-]\d{2}:\d{2}")
+
+
+def parse_zone_offset(value: object) -> str | None:
+    """An offset as '+HH:MM' ("Z", as Java's ZoneOffset spells UTC, is '+00:00'); None when it is not one."""
+    if not isinstance(value, str):
+        return None
+    value = _normalize_zone_offset(value.strip())
+    return value if value and _ZONE_OFFSET_RE.fullmatch(value) else None
+
+
 def local_date(dt: datetime, zone_offset: str | None) -> date:
     """The calendar day of an instant at its offset, as SQL readers compute it; no offset is UTC."""
     return dt.astimezone(iso_to_timezone(zone_offset or "+00:00")).date()

@@ -9,7 +9,7 @@ Apple Watch sleep data patterns:
 - Newer Apple Watch (watchOS 9+): "in_bed", "awake", "light", "deep", "rem" stages
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
@@ -17,7 +17,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.constants.sleep import SleepStageType
-from app.models import EventRecord, HealthScore
+from app.models import DataSource, EventRecord, HealthScore
 from app.schemas.enums import DeviceType, HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import (
     EventRecordCreate,
@@ -1421,7 +1421,7 @@ class TestFinishSleepNotifiesHos:
 
         finish_sleep(db, user_id, self._state())
 
-        notify.assert_called_once_with([user_id], "apple")
+        notify.assert_called_once_with([user_id], "apple", dates=[date(2026, 11, 11)])
 
     @patch("app.services.sdk.sleep_service.schedule_hos_notify")
     @patch("app.services.sdk.sleep_service.event_record_service")
@@ -1435,3 +1435,309 @@ class TestFinishSleepNotifiesHos:
         finish_sleep(db, str(uuid4()), self._state())
 
         notify.assert_not_called()
+
+
+class TestFinishSleepNotifiesWakeDate:
+    """The notify names the night's member-local wake date, the day HOS files it under."""
+
+    def _state(self, zone_offset: str | None) -> SleepState:
+        # 15:00-22:30 UTC: a night that ends at 06:30 the next morning in UTC+8
+        return SleepState(
+            uuid=str(uuid4()),
+            source_name="Health Connect",
+            source_app_id="com.ultrahuman.android",
+            provider="health_connect",
+            zone_offset=zone_offset,
+            start_time=_dt("2026-11-14T15:00:00Z"),
+            end_time=_dt("2026-11-14T22:30:00Z"),
+            last_start_timestamp=_dt("2026-11-14T22:00:00Z"),
+            last_end_timestamp=_dt("2026-11-14T22:30:00Z"),
+            stages=[
+                SleepStateStage(
+                    stage=SleepStageType.LIGHT,
+                    start_time=_dt("2026-11-14T15:00:00Z"),
+                    end_time=_dt("2026-11-14T22:30:00Z"),
+                ),
+            ],
+        )
+
+    @patch("app.services.sdk.sleep_service.schedule_hos_notify")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
+    def test_wake_date_is_local(
+        self, delete_state: MagicMock, events: MagicMock, notify: MagicMock, db: Session
+    ) -> None:
+        events.create.return_value = MagicMock(id=uuid4())
+        events.find_adjacent_sleep_record.return_value = None
+        user_id = str(uuid4())
+
+        finish_sleep(db, user_id, self._state("+08:00"))
+
+        notify.assert_called_once_with([user_id], "health_connect", dates=[date(2026, 11, 15)])
+
+    @patch("app.services.sdk.sleep_service.schedule_hos_notify")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
+    def test_a_night_without_an_offset_takes_the_members_latest(
+        self, delete_state: MagicMock, events: MagicMock, notify: MagicMock, db: Session
+    ) -> None:
+        events.create.return_value = MagicMock(id=uuid4())
+        events.find_adjacent_sleep_record.return_value = None
+        events.get_latest_zone_offset.return_value = "+08:00"
+        user_id = str(uuid4())
+
+        with patch("app.services.sdk.sleep_service.logger") as log:
+            finish_sleep(db, user_id, self._state(None))
+
+        saved: EventRecordCreate = events.create.call_args[0][1]
+        assert saved.zone_offset == "+08:00"
+        notify.assert_called_once_with([user_id], "health_connect", dates=[date(2026, 11, 15)])
+        assert log.warning.call_args.kwargs["action"] == "sleep_zone_offset_fallback"
+        assert log.warning.call_args.kwargs["fallback"] == "member_latest"
+
+    @patch("app.services.sdk.sleep_service.schedule_hos_notify")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
+    def test_without_any_offset_the_night_stays_utc_and_is_logged(
+        self, delete_state: MagicMock, events: MagicMock, notify: MagicMock, db: Session
+    ) -> None:
+        events.create.return_value = MagicMock(id=uuid4())
+        events.find_adjacent_sleep_record.return_value = None
+        events.get_latest_zone_offset.return_value = None
+        user_id = str(uuid4())
+
+        with patch("app.services.sdk.sleep_service.logger") as log:
+            finish_sleep(db, user_id, self._state(None))
+
+        assert events.create.call_args[0][1].zone_offset is None
+        notify.assert_called_once_with([user_id], "health_connect", dates=[date(2026, 11, 14)])
+        assert log.warning.call_args.kwargs["fallback"] == "utc"
+
+    @patch("app.services.sdk.sleep_service.schedule_hos_notify")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.delete_sleep_state")
+    def test_java_utc_spelling_is_the_nights_own_offset(
+        self, delete_state: MagicMock, events: MagicMock, notify: MagicMock, db: Session
+    ) -> None:
+        """Java's ZoneOffset.toString() spells UTC "Z": that is an offset, not a missing one."""
+        events.create.return_value = MagicMock(id=uuid4())
+        events.find_adjacent_sleep_record.return_value = None
+        events.get_latest_zone_offset.return_value = "+08:00"
+
+        finish_sleep(db, str(uuid4()), self._state("Z"))
+
+        assert events.create.call_args[0][1].zone_offset == "+00:00"
+        events.get_latest_zone_offset.assert_not_called()
+
+
+HC_NIGHT_STAGES = [
+    {"stage": "light", "start_time": "2026-11-14T23:00:00+00:00", "end_time": "2026-11-15T01:00:00+00:00"},
+    {"stage": "deep", "start_time": "2026-11-15T01:00:00+00:00", "end_time": "2026-11-15T03:00:00+00:00"},
+    {"stage": "rem", "start_time": "2026-11-15T03:00:00+00:00", "end_time": "2026-11-15T06:00:00+00:00"},
+]
+
+
+def _hc_night_payload() -> SyncRequest:
+    """One Health Connect night as the Android SDK sends it: a stage per entry, ids `<session id>_<index>`."""
+    return SyncRequest.model_validate(
+        {
+            "provider": "health_connect",
+            "sdkVersion": "0.10.0",
+            "syncTimestamp": "2026-11-16T08:00:00Z",
+            "data": {
+                "sleep": [
+                    {
+                        "id": f"hc-session-1_{i}",
+                        "stage": stage["stage"],
+                        "startDate": stage["start_time"],
+                        "endDate": stage["end_time"],
+                        "zoneOffset": "+00:00",
+                        "source": {"appId": "com.google.android.apps.fitness", "deviceType": "watch"},
+                    }
+                    for i, stage in enumerate(HC_NIGHT_STAGES)
+                ]
+            },
+        }
+    )
+
+
+class TestResentNight:
+    """The app re-reads the last 48 h of sleep on the first open of the day; a re-sent night must not be lost."""
+
+    @patch("app.services.sdk.sleep_service.schedule_hos_notify")
+    @patch("app.services.sdk.sleep_service.celery_app")
+    @patch("app.services.sdk.sleep_service.event_record_service")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_a_resent_night_keeps_its_record_and_refreshes_it(
+        self,
+        mock_redis_func: MagicMock,
+        events: MagicMock,
+        mock_celery: MagicMock,
+        notify: MagicMock,
+        db: Session,
+    ) -> None:
+        stored = MagicMock()
+        stored.id = uuid4()
+        stored.zone_offset = "+00:00"
+        stored.start_datetime = _dt("2026-11-14T23:00:00Z")
+        stored.end_datetime = _dt("2026-11-15T06:00:00Z")
+        stored.sleep_detail.sleep_stages = HC_NIGHT_STAGES
+        events.find_adjacent_sleep_record.return_value = stored
+        # Same window as the stored night, so the unique index hands the stored record back
+        events.create.return_value = stored
+        mock_redis_func.return_value.get.return_value = None
+        mock_redis_func.return_value.hgetall.return_value = {}
+        user_id = str(uuid4())
+
+        handle_sleep_data(db, _hc_night_payload(), user_id)
+
+        saved: EventRecordCreate = events.create.call_args[0][1]
+        assert (saved.start_datetime, saved.end_datetime) == (stored.start_datetime, stored.end_datetime)
+        events.delete.assert_not_called()
+        events.create_detail.assert_not_called()
+        events.refresh_sleep_detail.assert_called_once()
+        refreshed: EventRecordDetailCreate = events.refresh_sleep_detail.call_args[0][1]
+        assert refreshed.record_id == stored.id
+        assert refreshed.sleep_deep_minutes == 120
+        notify.assert_called_once_with([user_id], "health_connect", dates=[date(2026, 11, 15)])
+
+    def test_a_resent_night_lands_on_one_stored_record(self, db: Session) -> None:
+        """On the database: the same night uploaded twice is one record, not none and not two."""
+        user = UserFactory()
+        with (
+            patch("app.services.sdk.sleep_service.celery_app"),
+            patch("app.services.sdk.sleep_service.schedule_hos_notify"),
+        ):
+            handle_sleep_data(db, _hc_night_payload(), str(user.id))
+            handle_sleep_data(db, _hc_night_payload(), str(user.id))
+
+        nights = (
+            db.query(EventRecord)
+            .join(DataSource, EventRecord.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user.id, EventRecord.category == "sleep")
+            .all()
+        )
+        assert len(nights) == 1
+        assert nights[0].sleep_detail.sleep_deep_minutes == 120
+
+
+class TestHealthConnectSessions:
+    """Health Connect and Samsung write a night as one finished session."""
+
+    NOW = _dt("2026-11-15T07:00:00Z")
+
+    def _state(self, provider: str, ended_ago: int, received_ago: int) -> SleepState:
+        end = self.NOW - timedelta(minutes=ended_ago)
+        return SleepState(
+            uuid=str(uuid4()),
+            provider=provider,
+            source_app_id="com.sec.android.app.shealth",
+            start_time=end - timedelta(hours=7),
+            end_time=end,
+            last_start_timestamp=end - timedelta(minutes=10),
+            last_end_timestamp=end,
+            last_received_at=self.NOW - timedelta(minutes=received_ago),
+        )
+
+    @pytest.mark.parametrize("provider", ["health_connect", "samsung"])
+    def test_closes_once_the_upload_goes_quiet(self, provider: str) -> None:
+        assert is_ready_to_finish(self._state(provider, ended_ago=30, received_ago=15), self.NOW)
+
+    @pytest.mark.parametrize("provider", ["health_connect", "samsung"])
+    def test_stays_open_while_uploads_arrive(self, provider: str) -> None:
+        assert not is_ready_to_finish(self._state(provider, ended_ago=30, received_ago=5), self.NOW)
+
+    @patch("app.services.sdk.sleep_service.celery_app")
+    @patch("app.services.sdk.sleep_service.finish_sleep")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_a_night_written_hours_late_is_saved_at_once(
+        self, mock_redis_func: MagicMock, mock_finish: MagicMock, mock_celery: MagicMock
+    ) -> None:
+        """Ultrahuman writes last night to Health Connect hours after waking: no gap to wait out, nothing stale."""
+        mock_redis_func.return_value.get.return_value = None
+        mock_redis_func.return_value.hgetall.return_value = {}
+        woke = datetime.now(timezone.utc).replace(microsecond=0) - timedelta(hours=9)
+        source = {"appId": "com.ultrahuman.android"}
+        payload = SyncRequest.model_validate(
+            {
+                "provider": "health_connect",
+                "sdkVersion": "0.10.0",
+                "syncTimestamp": datetime.now(timezone.utc).isoformat(),
+                "data": {
+                    "sleep": [
+                        {
+                            "id": "uh-night_0",
+                            "stage": "light",
+                            "startDate": (woke - timedelta(hours=7)).isoformat(),
+                            "endDate": (woke - timedelta(hours=3)).isoformat(),
+                            "zoneOffset": "+05:30",
+                            "source": source,
+                        },
+                        {
+                            "id": "uh-night_1",
+                            "stage": "deep",
+                            "startDate": (woke - timedelta(hours=3)).isoformat(),
+                            "endDate": woke.isoformat(),
+                            "zoneOffset": "+05:30",
+                            "source": source,
+                        },
+                    ]
+                },
+            }
+        )
+
+        handle_sleep_data(MagicMock(), payload, str(uuid4()))
+
+        mock_finish.assert_called_once()
+        finished: SleepState = mock_finish.call_args[0][2]
+        assert finished.end_time == woke
+        assert finished.zone_offset == "+05:30"
+        assert len(finished.stages) == 2
+
+    @patch("app.services.sdk.sleep_service.celery_app")
+    @patch("app.services.sdk.sleep_service.finish_sleep")
+    @patch("app.services.sdk.sleep_service.get_redis_client")
+    def test_health_connect_stage_names_are_kept_and_unknown_ones_logged(
+        self, mock_redis_func: MagicMock, mock_finish: MagicMock, mock_celery: MagicMock
+    ) -> None:
+        mock_redis_func.return_value.get.return_value = None
+        mock_redis_func.return_value.hgetall.return_value = {}
+        samples = [
+            ("STAGE_TYPE_LIGHT", "2026-11-14T23:00:00Z", "2026-11-15T01:00:00Z"),
+            ("STAGE_TYPE_AWAKE_IN_BED", "2026-11-15T01:00:00Z", "2026-11-15T01:10:00Z"),
+            (5, "2026-11-15T01:10:00Z", "2026-11-15T03:00:00Z"),
+            ("napping", "2026-11-15T03:00:00Z", "2026-11-15T03:30:00Z"),
+        ]
+        payload = SyncRequest.model_validate(
+            {
+                "provider": "health_connect",
+                "sdkVersion": "0.10.0",
+                "syncTimestamp": "2026-11-15T08:00:00Z",
+                "data": {
+                    "sleep": [
+                        {"stage": stage, "startDate": start, "endDate": end, "zoneOffset": "+00:00"}
+                        for stage, start, end in samples
+                    ]
+                },
+            }
+        )
+        user_id = str(uuid4())
+
+        with patch("app.services.sdk.sleep_service.logger") as log:
+            handle_sleep_data(MagicMock(), payload, user_id)
+
+        saved = SleepState.model_validate_json(mock_redis_func.return_value.hset.call_args[0][2])
+        assert [s.stage for s in saved.stages] == [SleepStageType.LIGHT, SleepStageType.AWAKE, SleepStageType.DEEP]
+        unrecognized = [
+            c.kwargs for c in log.warning.call_args_list if c.kwargs.get("action") == "sleep_unrecognized_stage"
+        ]
+        assert unrecognized == [
+            {
+                "action": "sleep_unrecognized_stage",
+                "provider": "health_connect",
+                "user_id": user_id,
+                "count": 1,
+                "total": 4,
+                "stages": {"napping": 1},
+            }
+        ]

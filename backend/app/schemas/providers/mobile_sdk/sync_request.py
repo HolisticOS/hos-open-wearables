@@ -94,7 +94,8 @@ class SleepRecord(BaseModel):
 
     id: str | None = None
     parentId: str | None = None
-    stage: SleepPhase | str
+    # int: a Health Connect STAGE_TYPE_* code, mapped by get_apple_sleep_phase
+    stage: SleepPhase | str | int
     startDate: datetime
     endDate: datetime
     zoneOffset: str | None = None

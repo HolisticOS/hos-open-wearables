@@ -214,6 +214,32 @@ class EventRecordService(
 
         return result
 
+    def refresh_sleep_detail(self, db_session: DbSession, detail: EventRecordDetailCreate) -> None:
+        """Overwrite a stored night's sleep metrics and stages (the nap flag stays), creating the row if missing.
+
+        A night re-sent over the same window lands on the stored record, whose detail create() would keep as is.
+        """
+        if self.event_record_detail_repo.get_by_record_id(db_session, detail.record_id, EventCategory.SLEEP) is None:
+            self.create_detail(db_session, detail, detail_type=EventCategory.SLEEP)
+            return
+        fields = detail.model_dump(
+            mode="json",
+            include={
+                "sleep_total_duration_minutes",
+                "sleep_time_in_bed_minutes",
+                "sleep_efficiency_score",
+                "sleep_deep_minutes",
+                "sleep_rem_minutes",
+                "sleep_light_minutes",
+                "sleep_awake_minutes",
+                "sleep_stages",
+            },
+        )
+        if detail.sleep_efficiency_score is not None:
+            fields["sleep_efficiency_score"] = detail.sleep_efficiency_score  # Decimal, not the JSON string
+        self.event_record_detail_repo.update_sleep_fields(db_session, detail.record_id, fields)
+        db_session.commit()
+
     @staticmethod
     def _to_local(dt: datetime, zone_offset: str | None) -> datetime:
         """Shift a datetime into the session's local zone (mirrors SQL logic in fill task)."""
@@ -341,6 +367,10 @@ class EventRecordService(
                 "Nap re-flagging failed after sleep write", exc_info=e, record_id=str(record_id), user_id=str(user_id)
             )
         return False
+
+    def get_latest_zone_offset(self, db_session: DbSession, user_id: UUID) -> str | None:
+        """The member's offset as OW last saw it, for data that arrives without one."""
+        return self.crud.get_latest_zone_offset(db_session, user_id)
 
     def find_adjacent_sleep_record(
         self,

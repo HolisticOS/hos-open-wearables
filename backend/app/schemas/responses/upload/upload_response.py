@@ -26,6 +26,8 @@ class UploadDataResponse(BaseModel):
     )
     # Worker-side only: what the batch covered per type, for the run's progress. Never serialized.
     spans: dict[str, tuple[datetime, datetime]] = Field(default_factory=dict, exclude=True)
+    # Worker-side only: the member-local days (ISO dates) the batch touched, for the HOS notify. Never serialized.
+    dates: list[str] = Field(default_factory=list, exclude=True)
     workouts_saved: int = Field(0, description="Workouts saved")
     meals_saved: int = Field(0, description="Meal correlations saved")
     sleep_saved: int = Field(0, description="Sleep records saved")

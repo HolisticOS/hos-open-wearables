@@ -132,6 +132,34 @@ class TestProcessSDKUploadTask:
 
         assert roll_up_soon.called is rolls_up
 
+    @patch("app.integrations.celery.tasks.process_sdk_upload_task.schedule_hos_notify")
+    @patch("app.integrations.celery.tasks.process_sdk_upload_task.sdk_import_service")
+    @patch("app.integrations.celery.tasks.process_sdk_upload_task.SessionLocal")
+    @patch("app.integrations.celery.tasks.process_sdk_upload_task.UserRepository")
+    def test_a_saved_batch_notifies_hos_with_its_days(
+        self,
+        mock_user_repo_class: MagicMock,
+        mock_session_local: MagicMock,
+        mock_sdk_import_service: MagicMock,
+        notify: MagicMock,
+        db: Session,
+        mock_celery_app: MagicMock,
+    ) -> None:
+        user = UserFactory()
+        mock_session_local.return_value.__enter__ = MagicMock(return_value=db)
+        mock_session_local.return_value.__exit__ = MagicMock(return_value=None)
+        mock_user_repo_class.return_value.get.return_value = user
+        response = mock_sdk_import_service.import_data_from_request.return_value
+        response.model_dump.return_value = {"status_code": 200, "records_saved": 3}
+        response.dates = ["2026-11-14", "2026-11-15"]
+
+        with patch("app.integrations.rollup_queue.roll_up_soon"):
+            process_sdk_upload(
+                content="{}", content_type="application/json", user_id=str(user.id), provider="health_connect"
+            )
+
+        notify.assert_called_once_with([str(user.id)], "health_connect", dates=["2026-11-14", "2026-11-15"])
+
     @patch("app.integrations.celery.tasks.process_sdk_upload_task.SessionLocal")
     @patch("app.integrations.celery.tasks.process_sdk_upload_task.UserRepository")
     def test_process_sdk_upload_user_check_uses_correct_uuid(

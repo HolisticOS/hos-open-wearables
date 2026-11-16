@@ -247,7 +247,7 @@ def process_sdk_upload(
                 # The SDK sends no day values of its own: its days and summaries are ours, so roll them up now.
                 rollup_queue.roll_up_soon()
                 # Tell HOS right away so detected events and challenges don't wait for an app open.
-                schedule_hos_notify([user_id], provider)
+                schedule_hos_notify([user_id], provider, dates=response.dates or None)
             # Same wording as webhook_push_task; records_saved counts samples submitted.
             message = f"{provider.capitalize()} batch saved: {records_inserted} new, {records_updated} updated"
             if dropped_count:

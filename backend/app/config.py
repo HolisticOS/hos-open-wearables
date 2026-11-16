@@ -134,7 +134,7 @@ class Settings(BaseSettings):
 
     # Time between sleep phases to conclude end of sleep session
     sleep_end_gap_minutes: int = 120  # 2 hours
-    # Time without uploads to conclude end of Apple Watch sleep session
+    # Time without uploads to conclude end of an Apple Watch, Health Connect or Samsung sleep session
     sleep_upload_quiet_minutes: int = 15
 
     # Share of a sleep or workout a better-ranked source's sessions must cover for per-session selection to drop it

@@ -2,9 +2,9 @@ import json
 import time
 from collections import Counter
 from collections.abc import Generator
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
-from typing import Any, Iterable, TypedDict
+from typing import Any, Callable, Iterable, TypedDict
 from uuid import UUID, uuid4
 
 import sentry_sdk
@@ -52,7 +52,7 @@ from app.schemas.providers.mobile_sdk.sync_request import (
 from app.schemas.responses.upload import UploadDataResponse
 from app.services.event_record_service import event_record_service
 from app.services.timeseries_service import timeseries_service
-from app.utils.dates import window_seconds
+from app.utils.dates import as_utc, local_date, parse_zone_offset, window_seconds
 from app.utils.structured_logging import get_logger
 from app.utils.units import BloodGlucoseUnit, EnergyUnit, UnitConverter, VolumeUnit
 
@@ -124,6 +124,7 @@ class LoadDataResult(TypedDict):
     types: list[str]  # series types written
     spans: dict[str, tuple[datetime, datetime]]  # per type the device exports itself: record series, workouts, sleep
     sleep_saved: int
+    dates: list[str]  # member-local days the batch's records touched, for the HOS notify
     dropped: list[InvalidRecord]
     unsupported_types: dict[str, int]  # record types with no series mapping, skipped
     validation_ms: float
@@ -173,6 +174,42 @@ def _parse_sync_request(raw: dict) -> tuple[SDKSyncRequest, list[InvalidRecord]]
         {**raw, "data": SyncRequestData(records=kept["records"], sleep=kept["sleep"], workouts=kept["workouts"])}
     )
     return request, dropped
+
+
+# A record spanning more days than this (a mistaken span) adds only its first and last day.
+_MAX_SPAN_DAYS = 7
+
+
+def batch_local_dates(request: SDKSyncRequest, member_offset: Callable[[], str | None]) -> list[str]:
+    """The member-local calendar days the batch's records, workouts and sleep touch, as ISO dates, sorted.
+
+    Records and workouts add every day they span; sleep adds its wake day only (the day a night is filed under).
+    A record's own zoneOffset decides its day. One without takes the batch's offset (the same phone, so the
+    same member), else the member's latest known offset (``member_offset``, only asked when needed), else UTC.
+    """
+    spans: list[tuple[datetime, datetime, str | None]] = [
+        (item.startDate, item.endDate, parse_zone_offset(item.zoneOffset))
+        for collection in (request.data.records, request.data.workouts)
+        for item in collection
+    ]
+    spans += [(item.endDate, item.endDate, parse_zone_offset(item.zoneOffset)) for item in request.data.sleep]
+    if not spans:
+        return []
+    with_offset = [(end, offset) for _, end, offset in spans if offset]
+    fallback: str | None = max(with_offset, key=lambda pair: as_utc(pair[0]))[1] if with_offset else None
+    if fallback is None and len(with_offset) < len(spans):
+        fallback = parse_zone_offset(member_offset())
+
+    days: set[date] = set()
+    for start, end, offset in spans:
+        first, last = local_date(as_utc(start), offset or fallback), local_date(as_utc(end), offset or fallback)
+        if last < first:
+            first, last = last, first
+        if (last - first).days > _MAX_SPAN_DAYS:
+            days.update((first, last))
+            continue
+        days.update(first + timedelta(days=n) for n in range((last - first).days + 1))
+    return sorted(day.isoformat() for day in days)
 
 
 class ImportService:
@@ -720,6 +757,10 @@ class ImportService:
             for segment in request.data.sleep:
                 widen("sleep", segment.startDate, segment.endDate)
 
+        dates = batch_local_dates(
+            request, lambda: self.event_record_service.get_latest_zone_offset(db_session, UUID(user_id))
+        )
+
         return {
             "workouts_saved": workouts_saved,
             "meals_saved": meals_saved,
@@ -729,6 +770,7 @@ class ImportService:
             "types": sorted(types),
             "spans": spans,
             "sleep_saved": sleep_saved,
+            "dates": dates,
             "dropped": dropped,
             "unsupported_types": dict(unsupported_types),
             "validation_ms": validation_ms,
@@ -844,6 +886,7 @@ class ImportService:
                 records_updated=saved_counts["records_updated"],
                 types=saved_counts["types"],
                 spans=saved_counts["spans"],
+                dates=saved_counts["dates"],
                 workouts_saved=saved_counts["workouts_saved"],
                 meals_saved=saved_counts["meals_saved"],
                 sleep_saved=saved_counts["sleep_saved"],
