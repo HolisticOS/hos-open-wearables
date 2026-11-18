@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="referrer" content="no-referrer">
+<title>Connect Check</title>
+<style>
+  :root {
+    --bg: #f6f5f2; --card: #ffffff; --ink: #1b1b1a; --muted: #6b6a66; --line: #e4e2dc;
+    --ok: #1f7a4d; --ok-bg: #e5f3eb; --warn: #8a5a00; --warn-bg: #fbf0d9; --accent: #1b1b1a; --accent-ink: #fff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #121211; --card: #1c1c1b; --ink: #f1f0ec; --muted: #a09f9a; --line: #2e2e2c;
+      --ok: #6fd3a0; --ok-bg: #16301f; --warn: #f0c56b; --warn-bg: #33270f; --accent: #f1f0ec; --accent-ink: #121211;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 0 0 12px; display: flex; justify-content: space-between; align-items: baseline; }
+  h2 small { color: var(--muted); font-weight: 400; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 14px; }
+  .status { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; justify-content: space-between; }
+  .pill { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 13px; font-weight: 600; }
+  .pill.ok { color: var(--ok); background: var(--ok-bg); }
+  .pill.wait { color: var(--warn); background: var(--warn-bg); }
+  .meta { color: var(--muted); font-size: 13px; }
+  .btn { appearance: none; border: 0; border-radius: 10px; padding: 10px 16px; font: inherit; font-weight: 600;
+    background: var(--accent); color: var(--accent-ink); cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); font-weight: 500; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .metric { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .metric b { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+  .metric span { color: var(--muted); font-size: 12px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { padding: 10px 0; border-top: 1px solid var(--line); display: flex; justify-content: space-between; gap: 12px; }
+  li:first-child { border-top: 0; }
+  li .r { text-align: right; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  .empty { color: var(--muted); font-size: 14px; }
+  .steps { margin: 8px 0 0; padding-left: 18px; color: var(--muted); font-size: 14px; }
+  .foot { color: var(--muted); font-size: 12px; margin-top: 20px; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+  .error { color: #b3261e; }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Connect check</h1>
+  <p class="sub">Connect your account, then sync your watch in its app. Your data shows up here as it arrives.</p>
+
+  <section class="card">
+    <div class="status">
+      <div>
+        <span id="pill" class="pill wait">Checking…</span>
+        <div id="meta" class="meta"></div>
+      </div>
+      <a id="connect" class="btn" href="#" hidden>Connect</a>
+    </div>
+    <ol id="howto" class="steps" hidden>
+      <li>Tap <b>Connect</b> and sign in to your account.</li>
+      <li>Open the watch app on your phone and sync.</li>
+      <li>Keep this page open; it refreshes every 15 seconds.</li>
+    </ol>
+  </section>
+
+  <section class="card">
+    <h2>Latest readings <small>last 30 days</small></h2>
+    <div id="metrics" class="grid"></div>
+  </section>
+
+  <section class="card">
+    <h2>Sleep <small id="sleep-count"></small></h2>
+    <ul id="sleep"></ul>
+  </section>
+
+  <section class="card">
+    <h2>Workouts <small id="workout-count"></small></h2>
+    <ul id="workouts"></ul>
+  </section>
+
+  <div class="foot">
+    <span id="updated">Not loaded yet</span>
+    <button id="disconnect" class="btn ghost" hidden>Disconnect and delete my data</button>
+  </div>
+</main>
+<script>
+(() => {
+  const base = location.pathname.replace(/\/+$/, "");
+  const $ = (id) => document.getElementById(id);
+  const names = { zepp: "Zepp (Amazfit)", garmin: "Garmin", polar: "Polar", oura: "Oura", whoop: "WHOOP" };
+  const series = {
+    heart_rate_variability_rmssd: ["HRV", (v) => `${Math.round(v)} ms`],
+    resting_heart_rate: ["Resting HR", (v) => `${Math.round(v)} bpm`],
+    oxygen_saturation: ["SpO2", (v) => `${Math.round(v)}%`],
+    steps: ["Steps", (v) => Math.round(v).toLocaleString()],
+  };
+  const when = (iso) => iso ? new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }) : "—";
+  const hm = (s) => s == null ? "—" : `${Math.floor(s / 3600)}h ${String(Math.round((s % 3600) / 60)).padStart(2, "0")}m`;
+  const el = (tag, text, cls) => { const n = document.createElement(tag); if (text != null) n.textContent = text; if (cls) n.className = cls; return n; };
+  const row = (left, right) => { const li = el("li"); li.append(el("span", left), el("span", right, "r")); return li; };
+  const empty = (list, text) => { list.replaceChildren(el("li", text, "empty")); };
+
+  $("connect").href = `${base}/connect`;
+  if (new URLSearchParams(location.search).get("status") === "error") {
+    $("meta").textContent = "The connection didn't go through. Try Connect again.";
+    $("meta").classList.add("error");
+  }
+
+  function render(d) {
+    const label = names[d.provider] || d.provider;
+    document.title = `${label} connect check`;
+    $("title").textContent = `${label} connect check`;
+    $("connect").textContent = `Connect ${label}`;
+
+    const c = d.connection;
+    $("pill").className = `pill ${c.connected ? "ok" : "wait"}`;
+    $("pill").textContent = c.connected ? "Connected" : c.status === "revoked" ? "Disconnected" : "Not connected";
+    if (!$("meta").classList.contains("error") || c.connected) {
+      $("meta").classList.remove("error");
+      $("meta").textContent = c.connected
+        ? (c.last_synced_at ? `Last data received ${when(c.last_synced_at)}` : "Connected. Waiting for the first sync from your watch.")
+        : "";
+    }
+    $("connect").hidden = c.connected;
+    $("howto").hidden = c.connected && (d.sleep.length || d.workouts.length);
+    $("disconnect").hidden = !c.connected;
+
+    const metrics = $("metrics");
+    metrics.replaceChildren();
+    for (const [key, [name, fmt]] of Object.entries(series)) {
+      const values = d.series[key] || [];
+      const box = el("div", null, "metric");
+      box.append(el("b", values.length ? fmt(values[0].value) : "—"),
+                 el("span", values.length ? `${name} · ${when(values[0].timestamp)} · ${values.length} readings` : `${name} · nothing yet`));
+      metrics.append(box);
+    }
+
+    $("sleep-count").textContent = d.sleep.length ? `${d.sleep.length} nights` : "";
+    if (!d.sleep.length) empty($("sleep"), "No sleep yet. It arrives after your watch syncs in the morning.");
+    else $("sleep").replaceChildren(...d.sleep.map((s) => {
+      const st = s.stages || {};
+      const stages = [["deep", st.deep_seconds], ["light", st.light_seconds], ["REM", st.rem_seconds]]
+        .filter(([, v]) => v != null).map(([k, v]) => `${k} ${hm(v)}`).join(" · ");
+      return row(`${when(s.start_time)} → ${when(s.end_time)}`, `${hm(s.sleep_duration_seconds ?? s.duration_seconds)} asleep${stages ? " · " + stages : ""}`);
+    }));
+
+    $("workout-count").textContent = d.workouts.length ? `${d.workouts.length} workouts` : "";
+    if (!d.workouts.length) empty($("workouts"), "No workouts yet. Record one on the watch and sync.");
+    else $("workouts").replaceChildren(...d.workouts.map((w) => {
+      const bits = [hm(w.duration_seconds)];
+      if (w.avg_heart_rate_bpm) bits.push(`${w.avg_heart_rate_bpm} bpm avg`);
+      if (w.distance_meters) bits.push(`${(w.distance_meters / 1000).toFixed(2)} km`);
+      if (w.calories_kcal) bits.push(`${Math.round(w.calories_kcal)} kcal`);
+      return row(`${(w.type || "workout").replace(/_/g, " ")} · ${when(w.start_time)}`, bits.join(" · "));
+    }));
+
+    $("updated").textContent = `Updated ${new Date(d.generated_at).toLocaleTimeString()}`;
+  }
+
+  async function load() {
+    try {
+      const r = await fetch(`${base}/data`, { cache: "no-store" });
+      if (!r.ok) throw new Error(r.status === 404 ? "This link has expired or isn't valid." : `Couldn't load (${r.status}).`);
+      render(await r.json());
+    } catch (e) {
+      $("updated").textContent = e.message;
+    }
+  }
+
+  $("disconnect").addEventListener("click", async () => {
+    if (!confirm("Disconnect and delete the data this page shows?")) return;
+    $("disconnect").disabled = true;
+    await fetch(`${base}/disconnect`, { method: "POST" });
+    $("disconnect").disabled = false;
+    load();
+  });
+
+  load();
+  setInterval(load, 15000);
+})();
+</script>
+</body>
+</html>
