@@ -16,6 +16,7 @@ HEALTH_SCORE_RANGES: dict[HealthScoreCategory, dict[ProviderName, ScoreRange]] =
         ProviderName.WHOOP: ScoreRange(0, 100),
         ProviderName.POLAR: ScoreRange(1, 100),
         ProviderName.SAMSUNG: ScoreRange(0, 100),
+        ProviderName.ZEPP: ScoreRange(0, 100),
     },
     HealthScoreCategory.READINESS: {
         ProviderName.OURA: ScoreRange(1, 100),

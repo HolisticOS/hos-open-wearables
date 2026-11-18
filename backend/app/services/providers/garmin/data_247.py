@@ -90,6 +90,8 @@ class Garmin247Data(Base247DataTemplate):
     """
 
     CHUNK_HOURS = 24  # Garmin API max range per request
+    # EventRecord.source_name. Zepp reuses this class: its push API mirrors Garmin's Health API.
+    source_label = "Garmin"
     DEFAULT_BACKFILL_DAYS = 7  # Default retention period
 
     def __init__(
@@ -267,7 +269,7 @@ class Garmin247Data(Base247DataTemplate):
         return HealthScoreCreate(
             id=uuid4(),
             user_id=user_id,
-            provider=ProviderName.GARMIN,
+            provider=ProviderName(self.provider_name),
             category=HealthScoreCategory.SLEEP,
             value=sleep_score,
             qualifier=sleep_qualifier,
@@ -363,7 +365,7 @@ class Garmin247Data(Base247DataTemplate):
             id=nap_id,
             category=EventCategory.SLEEP,
             type="sleep_session",
-            source_name="Garmin",
+            source_name=self.source_label,
             device_model=None,
             duration_seconds=duration,
             start_datetime=self._from_epoch_seconds(start_ts),
@@ -412,7 +414,7 @@ class Garmin247Data(Base247DataTemplate):
             id=sleep_id,
             category=EventCategory.SLEEP,
             type="sleep_session",
-            source_name="Garmin",
+            source_name=self.source_label,
             device_model=None,
             duration_seconds=normalized_sleep.get("duration_seconds"),
             start_datetime=start_dt,
@@ -523,7 +525,7 @@ class Garmin247Data(Base247DataTemplate):
                 HealthScoreCreate(
                     id=uuid4(),
                     user_id=user_id,
-                    provider=ProviderName.GARMIN,
+                    provider=ProviderName(self.provider_name),
                     category=HealthScoreCategory.STRESS,
                     value=avg_stress,
                     qualifier=stress_qualifier,
@@ -1100,7 +1102,7 @@ class Garmin247Data(Base247DataTemplate):
             id=record_id,
             category=EventCategory.WORKOUT,
             type=activity_type.lower(),
-            source_name="Garmin",
+            source_name=self.source_label,
             device_model=raw_activity.get("deviceName"),
             duration_seconds=duration,
             start_datetime=start_dt,
@@ -1222,7 +1224,7 @@ class Garmin247Data(Base247DataTemplate):
         return HealthScoreCreate(
             id=uuid4(),
             user_id=user_id,
-            provider=ProviderName.GARMIN,
+            provider=ProviderName(self.provider_name),
             category=HealthScoreCategory.BODY_BATTERY,
             value=max(valid),
             recorded_at=self._from_epoch_seconds(start_ts),
@@ -1770,13 +1772,13 @@ class Garmin247Data(Base247DataTemplate):
             id=uuid4(),
             category=EventCategory.MENSTRUAL_CYCLE,
             type=phase_type,
-            source_name="Garmin",
+            source_name=self.source_label,
             duration_seconds=cycle_length * 24 * 3600 if cycle_length else None,
             start_datetime=start_dt,
             end_datetime=end_dt,
             external_id=summary_id,
             source=self.provider_name,
-            provider=ProviderName.GARMIN,
+            provider=ProviderName(self.provider_name),
             user_id=user_id,
         )
 

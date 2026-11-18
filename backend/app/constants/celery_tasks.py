@@ -44,6 +44,7 @@ class CeleryTask(StrEnum):
     SEND_TELEMETRY_PING = f"{_PREFIX}.telemetry_task.send_telemetry_ping"
     PROCESS_WEBHOOK_PUSH = f"{_PREFIX}.webhook_push_task.process_webhook_push"
     WITHINGS_SYNC_USER_SUBSCRIPTIONS = f"{_PREFIX}.withings.notify_sync_task.sync_user_subscriptions"
+    ZEPP_REQUEST_BACKFILL = f"{_PREFIX}.zepp.backfill_task.request_backfill"
 
 
 class CeleryQueue(StrEnum):

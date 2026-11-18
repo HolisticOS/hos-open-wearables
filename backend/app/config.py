@@ -234,6 +234,13 @@ class Settings(BaseSettings):
     garmin_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
     garmin_default_scope: str = ""  # Scope is managed at app creation in Garmin Developer Portal
 
+    # ZEPP (AMAZFIT) OAUTH SETTINGS
+    zepp_client_id: str | None = None
+    zepp_client_secret: SecretStr | None = None
+    zepp_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL
+    # Days of history requested when a member connects (Zepp caps one request at 30). 0 = none.
+    zepp_backfill_days: int = Field(30, ge=0, le=30)
+
     # POLAR OAUTH SETTINGS
     polar_client_id: str | None = None
     polar_client_secret: SecretStr | None = None

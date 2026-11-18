@@ -39,6 +39,8 @@ class ProviderEndpoints(BaseModel):
 
     authorize_url: str
     token_url: str
+    #: Where refresh_token grants go, when the provider doesn't take them at token_url (Zepp).
+    refresh_url: str | None = None
 
 
 class ProviderCredentials(BaseModel):

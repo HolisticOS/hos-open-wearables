@@ -176,7 +176,10 @@ def oauth_callback(
     # Garmin app without backfill access) while the others keep it.
     if settings.historical_sync_on_connect and provider_name.value not in settings.historical_sync_disabled_providers:
         caps = strategy.capabilities
-        if caps.webhook_callback:
+        if caps.webhook_callback and provider_name != ProviderName.GARMIN:
+            # A provider's own webhook backfill (Zepp): requested now, answered by pushes.
+            strategy.start_historical_sync(oauth_state.user_id, caps.max_historical_days or 30)
+        elif caps.webhook_callback:
             gap_start = user_connection_service.reconnect_gap_start(
                 db, oauth_state.user_id, provider_name.value, previous_synced_at
             )

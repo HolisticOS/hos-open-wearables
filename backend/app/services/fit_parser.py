@@ -74,6 +74,11 @@ class FitParseResult:
     developer_fields_found: list[str] = field(default_factory=list)
     hr_zones: HRZones | None = None
     power_zones: PowerZones | None = None
+    #: Totals of the first ``session`` message, for providers whose only workout record is the FIT
+    #: file itself (Zepp). Keys: start_time, total_elapsed_time, total_timer_time, sport, sub_sport,
+    #: avg_heart_rate, max_heart_rate, total_calories, total_distance, total_ascent, avg_speed,
+    #: max_speed, avg_cadence; a value is None when the file doesn't carry it.
+    session: dict[str, Any] | None = None
 
 
 def parse_fit_file(
@@ -90,6 +95,9 @@ def parse_fit_file(
         for frame in fit:
             if not isinstance(frame, fitdecode.FitDataMessage):
                 continue
+
+            if frame.name == "session" and result.session is None:
+                result.session = _session_summary(frame)
 
             if frame.name == "record":
                 ts = _timestamp(frame)
@@ -197,6 +205,30 @@ _SEGMENT_KINDS: dict[str, tuple] = {
     "split": (_SPLIT_NUMERIC, _SPLIT_ENUMS),
     "length": (_LENGTH_NUMERIC, _LENGTH_ENUMS),
 }
+
+
+_SESSION_NUMERIC: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("total_elapsed_time", ("total_elapsed_time",)),
+    ("total_timer_time", ("total_timer_time",)),
+    ("avg_heart_rate", ("avg_heart_rate",)),
+    ("max_heart_rate", ("max_heart_rate",)),
+    ("total_calories", ("total_calories",)),
+    ("total_distance", ("total_distance",)),
+    ("total_ascent", ("total_ascent",)),
+    ("avg_speed", ("enhanced_avg_speed", "avg_speed")),
+    ("max_speed", ("enhanced_max_speed", "max_speed")),
+    ("avg_cadence", ("avg_cadence",)),
+)
+
+
+def _session_summary(frame: fitdecode.FitDataMessage) -> dict[str, Any]:
+    """The workout totals a FIT ``session`` message carries."""
+    summary: dict[str, Any] = {"start_time": _iso(_field_val(frame, "start_time"))}
+    for key, names in _SESSION_NUMERIC:
+        summary[key] = next((v for n in names if (v := _r2(_field_val(frame, n))) is not None), None)
+    summary["sport"] = _known(_field_val(frame, "sport"))
+    summary["sub_sport"] = _known(_field_val(frame, "sub_sport"))
+    return summary
 
 
 def _field_val(frame: fitdecode.FitDataMessage, name: str) -> Any:

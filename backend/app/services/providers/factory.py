@@ -14,6 +14,7 @@ from app.services.providers.suunto.strategy import SuuntoStrategy
 from app.services.providers.ultrahuman.strategy import UltrahumanStrategy
 from app.services.providers.whoop.strategy import WhoopStrategy
 from app.services.providers.withings.strategy import WithingsStrategy
+from app.services.providers.zepp.strategy import ZeppStrategy
 
 
 class ProviderFactory:
@@ -50,5 +51,7 @@ class ProviderFactory:
                 return UltrahumanStrategy()
             case ProviderName.WITHINGS.value:
                 return WithingsStrategy()
+            case ProviderName.ZEPP.value:
+                return ZeppStrategy()
             case _:
                 raise ValueError(f"Unknown provider: {provider_name}")

@@ -50,6 +50,7 @@ from .sync_vendor_data_task import sync_vendor_data
 from .telemetry_task import send_telemetry_ping
 from .webhook_push_task import process_webhook_push
 from .withings.notify_sync_task import sync_user_subscriptions as sync_withings_user_subscriptions
+from .zepp.backfill_task import request_backfill as request_zepp_backfill
 
 __all__ = [
     # Garmin backfill (30-day webhook-based sync)
@@ -93,6 +94,7 @@ __all__ = [
     "process_webhook_push",
     "reconcile_provider_webhooks",
     "sync_withings_user_subscriptions",
+    "request_zepp_backfill",
     "renew_oura_webhooks",
     "send_telemetry_ping",
     # Outgoing webhooks

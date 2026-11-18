@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Zepp">
+  <!-- Placeholder: replace with the official Zepp logo from Zepp's brand assets. -->
+  <rect width="64" height="64" rx="14" fill="#111"/>
+  <path d="M18 18h28v6L27 40h19v6H18v-6l19-16H18z" fill="#fff"/>
+</svg>

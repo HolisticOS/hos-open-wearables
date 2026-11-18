@@ -62,8 +62,9 @@ _SDK = frozenset({ProviderName.APPLE, ProviderName.SAMSUNG, ProviderName.HEALTH_
 
 HISTORY_RULES: tuple[HistoryRule, ...] = (
     # Garmin dailies at the local midnight; steps and energy share their keys with epochs.
+    # Zepp's dailies push has Garmin's shape and goes through the same builder.
     HistoryRule(
-        frozenset({ProviderName.GARMIN}),
+        frozenset({ProviderName.GARMIN, ProviderName.ZEPP}),
         _own(
             SeriesType.steps,
             SeriesType.active_energy,
@@ -76,10 +77,13 @@ HISTORY_RULES: tuple[HistoryRule, ...] = (
         where=_DAILY_TOTAL,
         day=DayAnchor.LOCAL,
     ),
-    HistoryRule(frozenset({ProviderName.GARMIN}), _own(SeriesType.resting_heart_rate), day=DayAnchor.LOCAL),
-    # Garmin lastNightAvg carries the bare summaryId; its per-reading values carry "summaryId:offset".
     HistoryRule(
-        frozenset({ProviderName.GARMIN}),
+        frozenset({ProviderName.GARMIN, ProviderName.ZEPP}), _own(SeriesType.resting_heart_rate), day=DayAnchor.LOCAL
+    ),
+    # Garmin lastNightAvg carries the bare summaryId; its per-reading values carry "summaryId:offset".
+    # Zepp pushes the same HRV shape (and its own key when summaryId is null).
+    HistoryRule(
+        frozenset({ProviderName.GARMIN, ProviderName.ZEPP}),
         _own(SeriesType.heart_rate_variability_rmssd),
         where="s.external_id IS NOT NULL AND position(':' in s.external_id) = 0",
         day=DayAnchor.NIGHT_STARTED_AT,

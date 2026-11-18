@@ -184,7 +184,7 @@ class BaseOAuthTemplate(ABC):
 
         try:
             response = httpx.post(
-                self.endpoints.token_url,
+                self.endpoints.refresh_url or self.endpoints.token_url,
                 data=data,
                 headers=headers,
                 timeout=30.0,
