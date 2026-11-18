@@ -18,6 +18,7 @@ class ProviderName(str, Enum):
     ULTRAHUMAN = "ultrahuman"
     SENSORBIO = "sensorbio"
     WITHINGS = "withings"
+    ZEPP = "zepp"
     UNKNOWN = "unknown"
     INTERNAL = "internal"
 
@@ -61,6 +62,7 @@ DEFAULT_PROVIDER_PRIORITY: dict[ProviderName, int] = {
     ProviderName.STRAVA: 8,
     ProviderName.WITHINGS: 9,
     ProviderName.SENSORBIO: 10,
+    ProviderName.ZEPP: 11,
     ProviderName.APPLE: 20,
     ProviderName.SAMSUNG: 21,
     ProviderName.HEALTH_CONNECT: 22,

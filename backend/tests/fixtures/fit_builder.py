@@ -205,6 +205,63 @@ def make_running_fit(n_records: int = 20) -> bytes:
     return _fit_file(messages)
 
 
+# Session message (global_mesg_num=18), the activity's totals:
+#   253  timestamp          uint32
+#     2  start_time         uint32
+#     5  sport              enum    (1 running)
+#     7  total_elapsed_time uint32  (raw = seconds * 1000)
+#     8  total_timer_time   uint32  (raw = seconds * 1000)
+#     9  total_distance     uint32  (raw = meters * 100)
+#    11  total_calories     uint16  (kcal)
+#    16  avg_heart_rate     uint8
+#    17  max_heart_rate     uint8
+_ENUM: int = 0x00
+_SESSION_FIELDS: list[_Field] = [
+    _Field(253, _UINT32, 4),
+    _Field(2, _UINT32, 4),
+    _Field(5, _ENUM, 1),
+    _Field(7, _UINT32, 4),
+    _Field(8, _UINT32, 4),
+    _Field(9, _UINT32, 4),
+    _Field(11, _UINT16, 2),
+    _Field(16, _UINT8, 1),
+    _Field(17, _UINT8, 1),
+]
+
+
+def make_running_session_fit(
+    start: datetime = datetime(2025, 6, 1, 8, 0, 0, tzinfo=timezone.utc),
+    elapsed_s: int = 1800,
+    timer_s: int = 1750,
+    distance_m: int = 5000,
+    calories: int = 420,
+    avg_hr: int = 151,
+    max_hr: int = 178,
+) -> bytes:
+    """A running activity with a session message: one record, then the totals (as Zepp exports it)."""
+    start_ts = _fit_ts(start)
+    record_fields = [_Field(253, _UINT32, 4), _Field(3, _UINT8, 1)]
+    messages = _definition_msg(record_fields)
+    messages += _data_msg(record_fields, [start_ts, avg_hr])
+    messages += _definition_msg(_SESSION_FIELDS, local_type=2, global_num=18)
+    messages += _data_msg(
+        _SESSION_FIELDS,
+        [
+            start_ts + elapsed_s,
+            start_ts,
+            1,
+            elapsed_s * 1000,
+            timer_s * 1000,
+            distance_m * 100,
+            calories,
+            avg_hr,
+            max_hr,
+        ],
+        local_type=2,
+    )
+    return _fit_file(messages)
+
+
 def make_cycling_fit(n_records: int = 10) -> bytes:
     """Synthetic indoor cycling: HR only (no ANT+ sensors connected)."""
     fields = [
