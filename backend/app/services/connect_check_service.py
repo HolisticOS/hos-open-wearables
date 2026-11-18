@@ -131,7 +131,8 @@ class ConnectCheckService:
         return {
             "provider": provider,
             "connection": {
-                "status": connection.status.value if connection else None,
+                # The ORM hands the status back as a plain str.
+                "status": ConnectionStatus(connection.status).value if connection else None,
                 "connected": bool(connection and connection.status == ConnectionStatus.ACTIVE),
                 "last_synced_at": connection.last_synced_at.isoformat()
                 if connection and connection.last_synced_at
