@@ -5,6 +5,7 @@ from .applications import router as applications_router
 from .archival import router as archival_router
 from .auth import router as auth_router
 from .config import router as config_router
+from .connect_check import router as connect_check_router
 from .connections import router as connections_router
 from .dashboard import router as dashboard_router
 from .data_sources import router as data_sources_router
@@ -41,6 +42,7 @@ v1_router.include_router(meta_router, tags=["External: Meta"])
 v1_router.include_router(users_router, tags=["External: Users"])
 v1_router.include_router(personal_record_router, tags=["External: Users"])
 v1_router.include_router(connections_router, tags=["External: Connections"])
+v1_router.include_router(connect_check_router, tags=["External: Connect Check"])
 v1_router.include_router(summaries_router, tags=["External: Summaries"])
 v1_router.include_router(timeseries_router, tags=["External: Timeseries"])
 v1_router.include_router(events_router, tags=["External: Events"])
